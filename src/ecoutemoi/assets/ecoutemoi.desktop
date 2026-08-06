@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Écoute Moi
+GenericName=Sous-titrage et transcription en local
+Comment=Sous-titres temps réel pour conférences (sortie chroma pour OBS) et transcription de fichiers audio
+Exec=EcouteMoi %F
+Icon=ecoutemoi
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+Keywords=sous-titres;subtitles;whisper;transcription;OBS;accessibilité;
+# Types déclarés pour « Ouvrir avec… » : ceux que l'application décode sans rien
+# installer, plus les conteneurs vidéo qu'un ffmpeg présent débloque.
+MimeType=audio/x-wav;audio/wav;audio/flac;audio/mpeg;audio/mp4;audio/aac;audio/ogg;audio/x-vorbis+ogg;audio/opus;audio/x-aiff;audio/x-ms-wma;audio/basic;audio/x-caf;video/mp4;video/x-matroska;video/quicktime;video/webm;video/x-msvideo;
+StartupNotify=true
+StartupWMClass=EcouteMoi

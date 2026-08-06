@@ -1,0 +1,189 @@
+# Renovate auto-hébergé — ouvre les pull requests de montée de version.
+#
+# Pourquoi en Actions plutôt que l'application Mend : le bot vit dans le dépôt,
+# il se lit, se versionne et se rejoue à la main (`workflow_dispatch`). Aucune
+# installation d'application, aucun tableau de bord externe.
+#
+# Ce que Renovate surveille ici (voir renovate.json5 pour le détail) :
+#   - pyproject.toml     dépendances runtime et groupe dev ;
+#   - uv.lock            dépendances transitives (lockFileMaintenance) ;
+#   - .github/workflows  versions des actions (`uses:`).
+#
+# ┌─ INDISPENSABLE ────────────────────────────────────────────────────────────┐
+# │ Le secret RENOVATE_TOKEN doit exister (jeton personnel « fine-grained »    │
+# │ sur ce dépôt, permissions Contents: read/write, Pull requests: read/write, │
+# │ Issues: read/write pour le tableau de bord).                               │
+# │                                                                            │
+# │ Sans lui, on retombe sur GITHUB_TOKEN — et GitHub refuse par conception de │
+# │ déclencher un workflow depuis une PR ouverte par GITHUB_TOKEN. Les PR de   │
+# │ Renovate arriveraient alors SANS build ni tests, c'est-à-dire sans le seul │
+# │ signal qui les rend relisables. L'étape « Vérifier le jeton » ci-dessous   │
+# │ le signale en clair dans le résumé du run plutôt que de le laisser passer  │
+# │ inaperçu.                                                                  │
+# └────────────────────────────────────────────────────────────────────────────┘
+name: renovate
+
+on:
+  schedule:
+    - cron: "0 4 * * 1" # lundi 04:00 UTC, une heure avant la sonde de build
+  push:
+    branches: [main]
+    paths: ["renovate.json5", ".github/workflows/renovate.yml"]
+  pull_request:
+    paths: ["renovate.json5", ".github/workflows/renovate.yml"]
+  workflow_dispatch:
+    inputs:
+      dryRun:
+        description: "Simulation : analyse tout, n'ouvre aucune PR"
+        type: boolean
+        default: false
+      logLevel:
+        description: "Niveau de log (debug pour diagnostiquer une PR absente)"
+        type: choice
+        options: [info, debug]
+        default: info
+
+# Jamais deux Renovate en parallèle sur le même dépôt : ils se marcheraient sur
+# les branches. Pas d'annulation en cours de route — une exécution interrompue
+# peut laisser une branche à moitié poussée.
+concurrency:
+  group: renovate
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Une config invalide ne fait pas échouer Renovate : elle le fait abandonner
+  # le dépôt en silence, et les PR cessent d'arriver sans que rien ne l'annonce.
+  # Ce job est le garde-fou, et il tourne sur la PR qui modifie la config.
+  validate:
+    name: valider renovate.json5
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Node récent requis : sans lui, npm retombe sur une version antérieure de
+      # Renovate et la config serait validée avec les règles de la mauvaise
+      # version.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - name: renovate-config-validator (strict)
+        env:
+          # Les dépendances transitives de Renovate traînent une dizaine de
+          # `npm warn deprecated` : rien d'actionnable ici, et ça noie le seul
+          # message qui compte (« Config validated successfully »).
+          npm_config_loglevel: error
+        run: npx --yes --package renovate renovate-config-validator --strict
+
+  renovate:
+    name: renovate
+    needs: validate
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write # pousser les branches de mise à jour
+      pull-requests: write # ouvrir et mettre à jour les PR
+      issues: write # tableau de bord des dépendances
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Sans jeton dédié, Renovate pousse la branche puis échoue à ouvrir la PR
+      # (« Integration unauthorized - aborting »), en sortant malgré tout en
+      # code 0. Un bot vert qui n'ouvre aucune PR est pire que pas de bot : on
+      # croit être à jour. D'où l'échec franc plutôt qu'un avertissement.
+      #
+      # Deux causes, un seul remède : GITHUB_TOKEN ne peut créer de PR que si
+      # « Allow GitHub Actions to create and approve pull requests » est activé
+      # (désactivé par défaut), et même activé, GitHub refuse par conception de
+      # déclencher un workflow depuis une PR qu'il a ouverte — les PR
+      # arriveraient sans build ni tests. Un jeton dédié règle les deux.
+      - name: Exiger RENOVATE_TOKEN
+        if: ${{ !inputs.dryRun }}
+        env:
+          HAS_PAT: ${{ secrets.RENOVATE_TOKEN != '' }}
+        run: |
+          if [ "$HAS_PAT" = "true" ]; then
+            echo "RENOVATE_TOKEN présent — les PR déclencheront le workflow build." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "### RENOVATE_TOKEN absent — Renovate ne peut pas ouvrir de PR"
+            echo
+            echo "Créer un jeton *fine-grained* limité à ce dépôt, permissions"
+            echo "\`Contents\`, \`Pull requests\`, \`Issues\` et \`Workflows\` en"
+            echo "lecture/écriture, puis :"
+            echo
+            echo '```'
+            echo "gh secret set RENOVATE_TOKEN --repo $GITHUB_REPOSITORY"
+            echo '```'
+            echo
+            echo "\`Workflows\` est le plus souvent oublié : sans lui, la PR du"
+            echo "groupe « actions GitHub » échoue seule, à la poussée."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=RENOVATE_TOKEN absent::Renovate pousserait les branches sans pouvoir ouvrir les PR. Voir le résumé du run."
+          exit 1
+
+      - uses: renovatebot/github-action@v46.2.1
+        with:
+          token: ${{ secrets.RENOVATE_TOKEN || github.token }}
+        env:
+          # Un seul dépôt, pas d'auto-découverte : le bot ne peut pas déborder
+          # sur d'autres dépôts du compte si le jeton est plus large que prévu.
+          RENOVATE_REPOSITORIES: ${{ github.repository }}
+          RENOVATE_AUTODISCOVER: "false"
+          # renovate.json5 est déjà dans le dépôt : pas de PR d'accueil, et on
+          # échoue plutôt que de tourner sur une config par défaut silencieuse.
+          RENOVATE_ONBOARDING: "false"
+          RENOVATE_REQUIRE_CONFIG: "required"
+          # Vide = variable ignorée par Renovate (repli sur le défaut).
+          RENOVATE_DRY_RUN: ${{ inputs.dryRun && 'full' || '' }}
+          LOG_LEVEL: ${{ inputs.logLevel || 'info' }}
+
+      # Filet de sécurité derrière l'exigence de jeton : une branche `renovate/*`
+      # poussée sans PR ouverte est la signature EXACTE d'une autorisation
+      # refusée à mi-course (jeton sans la permission `Workflows`, jeton révoqué,
+      # règle d'organisation). Renovate sort en code 0 dans ces cas-là ; ce job,
+      # non.
+      - name: Aucune branche renovate/* sans PR
+        if: ${{ always() && !inputs.dryRun }}
+        env:
+          GH_TOKEN: ${{ secrets.RENOVATE_TOKEN || github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          orphans=()
+          while read -r branch; do
+            [ -n "$branch" ] || continue
+            # --state all : une PR fermée à la main n'est pas un refus
+            # d'autorisation, seulement une branche qu'on a laissée derrière soi.
+            count=$(gh pr list --head "$branch" --state all --json number --jq 'length')
+            if [ "$count" -eq 0 ]; then
+              orphans+=("$branch")
+            fi
+          done < <(gh api "repos/$GH_REPO/branches" --paginate --jq '.[].name' | grep '^renovate/' || true)
+
+          if [ ${#orphans[@]} -eq 0 ]; then
+            echo "Aucune branche renovate/* orpheline." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "### Branches poussées sans pull request"
+            echo
+            # `--` obligatoire : sans lui, bash lit le `-` du format comme une
+            # option et le step meurt (« printf: - : invalid option »).
+            printf -- '- `%s`\n' "${orphans[@]}"
+            echo
+            echo "Renovate a pu POUSSER mais pas OUVRIR : l'autorisation a été"
+            echo "refusée en cours de route. Vérifier les permissions du jeton"
+            echo "\`RENOVATE_TOKEN\` (\`Contents\`, \`Pull requests\`, \`Issues\`,"
+            echo "\`Workflows\` en lecture/écriture) et sa date d'expiration."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Branches renovate sans PR::${orphans[*]}"
+          exit 1

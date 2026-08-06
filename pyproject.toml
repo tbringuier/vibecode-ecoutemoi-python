@@ -1,0 +1,76 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ecoutemoi"
+dynamic = ["version"]
+description = "Écoute Moi — sous-titrage temps réel local et transcription de fichiers (whisper.cpp : Vulkan / Metal / CPU)"
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Tristan Bringuier" }]
+keywords = ["sous-titres", "subtitles", "whisper", "transcription", "accessibilité", "OBS"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "Natural Language :: French",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Adaptive Technologies",
+]
+dependencies = [
+    "pywhispercpp>=1.5.0",
+    "sounddevice>=0.5.5",
+    "soxr>=1.1",
+    "soundfile>=0.14",
+    "pyrnnoise>=0.4.3",
+    "webrtcvad-wheels>=2.0.14",
+    "numpy>=2.5",
+    "pyside6>=6.11",
+    "huggingface-hub>=1.26",
+    "tqdm>=4.67",
+    "psutil>=7.2",
+    "platformdirs>=4.11",
+]
+
+[project.urls]
+Source = "https://github.com/tbringuier/vibecode-ecoutemoi-python"
+Releases = "https://github.com/tbringuier/vibecode-ecoutemoi-python/releases"
+Issues = "https://github.com/tbringuier/vibecode-ecoutemoi-python/issues"
+
+[project.scripts]
+ecoutemoi = "ecoutemoi.app:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1",
+    "ruff>=0.16",
+    "pyinstaller>=6.21",
+]
+
+[tool.hatch.version]
+path = "src/ecoutemoi/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ecoutemoi"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py314"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+# RUF001-003: "ambiguous unicode" fights legitimate French typography (’ … ×).
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "integration: tests nécessitant réseau, modèles ou moteur réel",
+]

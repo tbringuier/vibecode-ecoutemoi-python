@@ -1,0 +1,95 @@
+// Renovate — configuration du dépôt.
+//
+// Auto-hébergé : c'est .github/workflows/renovate.yml qui l'exécute, pas
+// l'application Mend. Ce fichier dit QUOI mettre à jour et comment le
+// regrouper ; le workflow dit QUAND.
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommitsDisabled", // l'historique du dépôt est en français, sans préfixe conventionnel
+    ":rebaseStalePrs",
+  ],
+  timezone: "Europe/Paris",
+
+  // Le workflow est le SEUL ordonnanceur : sa cron hebdomadaire décide quand
+  // Renovate tourne. Toutes les `schedule` valent donc « at any time » — deux
+  // calendriers concurrents (cron du workflow + schedule Renovate) est le piège
+  // classique où plus aucune PR ne s'ouvre jamais.
+  schedule: ["at any time"],
+
+  labels: ["dépendances"],
+  dependencyDashboardTitle: "Tableau de bord des dépendances",
+
+  commitMessageAction: "Mettre à jour",
+  commitMessageTopic: "{{depName}}",
+  commitMessageExtra: "vers {{#if isPinDigest}}{{{newDigestShort}}}{{else}}{{{newValue}}}{{/if}}",
+
+  prBodyNotes: [
+    "La CI de cette PR lance lint, suite unitaire, tests d'intégration (inférence CPU réelle) **et construit les trois artefacts** (exe Windows Vulkan, AppImage Linux Vulkan, .app macOS Metal), chacun re-testé contre sa vraie wheel moteur.",
+    "Verte = la mise à jour ne casse ni le moteur, ni l'empaquetage, ni le démarrage des binaires. Les artefacts sont téléchargeables depuis la page du run.",
+  ],
+
+  // Le délai de 5 jours n'est pas une question de coût (dépôt public, minutes
+  // Actions offertes) mais de stabilité : les « yank » de PyPI et les retags
+  // d'actions arrivent surtout dans les premières heures d'une publication.
+  prConcurrentLimit: 6,
+  prHourlyLimit: 4,
+  minimumReleaseAge: "5 days",
+
+  // Rafraîchit les dépendances transitives d'uv.lock même quand aucune
+  // contrainte de pyproject.toml ne bouge. C'est ce qui empêche le lock de
+  // fossiliser au fil des années.
+  lockFileMaintenance: {
+    enabled: true,
+    schedule: ["at any time"],
+  },
+
+  // Les avis de sécurité ignorent le délai de 5 jours.
+  vulnerabilityAlerts: {
+    labels: ["dépendances", "sécurité"],
+    minimumReleaseAge: null,
+  },
+  osvVulnerabilityAlerts: true,
+
+  packageRules: [
+    {
+      description: "Le conteneur ubuntu:22.04 du job Linux EST le plancher de compatibilité glibc 2.35 de l'AppImage. Le monter n'est pas une mise à jour, c'est une décision de support : elle se prend à la main.",
+      matchDatasources: ["docker"],
+      matchPackageNames: ["ubuntu"],
+      enabled: false,
+    },
+    {
+      description: "Une seule PR pour toutes les actions GitHub — elles bougent souvent et cassent rarement seules.",
+      matchManagers: ["github-actions"],
+      groupName: "actions GitHub",
+    },
+    {
+      description: "Outillage de dev (pytest, ruff, pyinstaller) groupé à part du runtime.",
+      matchDepTypes: ["dev"],
+      groupName: "outillage de dev",
+    },
+    {
+      description: "Mineures et correctifs du runtime en une PR ; les majeures restent isolées (comportement par défaut).",
+      matchManagers: ["pep621"],
+      matchDepTypes: ["project.dependencies"],
+      matchUpdateTypes: ["minor", "patch"],
+      groupName: "dépendances Python (mineures)",
+    },
+    {
+      description: "pywhispercpp pilote la compilation des wheels Vulkan/Metal : jamais groupé, toujours relu seul.",
+      matchPackageNames: ["pywhispercpp"],
+      groupName: null,
+      addLabels: ["moteur"],
+      prPriority: 5,
+    },
+    {
+      description: "PySide6 majeur = migration Qt. PR isolée, jamais noyée dans un groupe.",
+      matchPackageNames: ["pyside6"],
+      matchUpdateTypes: ["major"],
+      groupName: null,
+      addLabels: ["Qt"],
+    },
+  ],
+}

@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.eggs/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local artifacts (models live in the user data dir, never in the repo)
+*.log
+/tmp/
+*.wav
+!tests/data/*.wav
+# Voix de référence TTS embarquées : REQUISES par le benchmark un-clic
+# (bench.reference_wavs) et vérifiées par test_reference_wavs_bundled_and_valid.
+!src/ecoutemoi/assets/calibration/*.wav
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Artefacts de packaging locaux
+wheelhouse/
+EcouteMoi-*.zip
+EcouteMoi-*.AppImage
+*.spec.bak

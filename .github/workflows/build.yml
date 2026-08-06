@@ -1,0 +1,410 @@
+# CI : lint → tests → (tests d'intégration ‖ artefacts) → release roulante.
+#
+# Le dépôt est public : les minutes Actions sont offertes sur les runners
+# standard. La CI est donc calibrée sur le SIGNAL, pas sur la facture — toute
+# pull request construit les trois artefacts et rejoue la suite contre la vraie
+# wheel Vulkan/Metal. C'est ce qui rend relisable une PR de Renovate : verte =
+# la montée de version ne casse ni le moteur, ni l'empaquetage, ni le démarrage.
+#
+# Ce qui reste optimisé l'est pour le temps d'attente, pas pour le coût :
+#   - le lint n'installe QUE le groupe dev (ruff verrouillé), pas PySide6/numpy ;
+#   - les tests unitaires du portail ne tournent que sur ubuntu — Windows et
+#     macOS rejouent la même suite dans leur job d'artefact, contre la wheel
+#     réelle, ce qui est un test strictement plus fort ;
+#   - la wheel moteur est mise en cache sur les TROIS OS, et l'installation des
+#     SDK de compilation (Vulkan, ~1 Go) est SAUTÉE quand le cache répond ;
+#   - le cache est écrit juste après la compilation (cache/save explicite) : un
+#     échec plus loin dans le job ne fait plus recompiler au run suivant.
+#
+# La cron hebdomadaire est une sonde de pourrissement : elle rejoue tout sans
+# qu'un commit soit nécessaire, et détecte ce qui casse depuis l'EXTÉRIEUR
+# (canal LunarG déplacé, release `continuous` d'appimagetool republiée, wheel
+# retirée de PyPI, image de runner remplacée). Sans elle, ces pannes ne se
+# découvrent que le jour où l'on a justement besoin de publier.
+#
+# Les runners n'ont pas de GPU : la CI valide le build et le chemin CPU ; le
+# backend Vulkan/Metal se valide sur une machine avec GPU.
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "LICENSE", ".gitignore"]
+  pull_request:
+    paths-ignore: ["**.md", "LICENSE", ".gitignore"]
+  schedule:
+    - cron: "0 5 * * 1" # lundi 05:00 UTC — sonde de pourrissement
+  workflow_dispatch:
+
+# Les runs d'une même PR se remplacent ; sur main, push/cron se mettent en file
+# (une annulation entre `release delete` et `release create` laisserait le
+# projet sans release « latest » du tout).
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      # Seul le groupe dev : ruff à la version verrouillée, sans installer
+      # PySide6/numpy/huggingface-hub dont le lint n'a aucun besoin.
+      - name: Install ruff (groupe dev seul)
+        run: uv sync --frozen --only-group dev --no-install-project
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync ruff format --check .
+
+  test:
+    name: tests unitaires (ubuntu)
+    runs-on: ubuntu-latest
+    needs: lint
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install (frozen lock)
+        run: uv sync --frozen
+      - name: Unit tests
+        run: uv run --no-sync pytest -m "not integration" -q
+      - name: Smoke — ecoutemoi --version
+        run: uv run --no-sync ecoutemoi --version
+
+  # Tests d'intégration : téléchargement de modèle + inférence CPU réelle +
+  # flux de 10 min + GUI offscreen. En parallèle des artefacts, pas devant eux.
+  integration:
+    name: integration (ubuntu)
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Qt offscreen runtime deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          libegl1 libgl1 libxkbcommon0 libfontconfig1 libglib2.0-0 libdbus-1-3
+      # Les modèles ggml sont immuables par nom de fichier : cache permanent.
+      - name: Cache modèles whisper
+        uses: actions/cache@v6
+        with:
+          path: ~/.local/share/EcouteMoi/models
+          key: whisper-models-integration-v1
+      - run: uv sync --frozen
+      - name: Integration tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: uv run --no-sync pytest -m integration -q
+
+  # ---------------------------------------------------------------- artifacts
+  # Construits sur TOUS les évènements, pull request comprise : une montée de
+  # version ne se relit pas, elle se démontre. Chaque job compile (ou restaure)
+  # sa wheel moteur, rejoue la suite unitaire contre elle, empaquette, puis
+  # démarre le binaire produit sans Python. Les artefacts d'une PR sont
+  # téléchargeables depuis la page du run pour un essai à la main.
+  windows:
+    name: artifact windows-x64 (Vulkan, onefile .exe)
+    runs-on: windows-latest
+    needs: test
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      # La wheel moteur (~10 min de compilation) ne dépend que de la version
+      # pywhispercpp verrouillée et du script de build : cache directe.
+      - name: Restore engine wheel
+        id: wheel
+        uses: actions/cache/restore@v6
+        with:
+          path: wheelhouse
+          key: engine-wheel-windows-v2-${{ hashFiles('scripts/build_wheel.ps1', 'uv.lock') }}
+      # SDK LunarG via Chocolatey : dernière version publiée, aucun numéro en dur.
+      # Le SDK fournit glslc, requis pour compiler les shaders Vulkan de ggml —
+      # donc inutile (et coûteux : ~4 min) quand la wheel est déjà en cache.
+      - name: Vulkan SDK (Chocolatey, dernière version)
+        if: steps.wheel.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          choco install vulkan-sdk -y --no-progress
+          $sdk = Get-ChildItem "C:\VulkanSDK" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $sdk) { Write-Error "SDK Vulkan introuvable sous C:\VulkanSDK" }
+          Write-Host "SDK installé : $($sdk.FullName)"
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=$($sdk.FullName)"
+          Add-Content $env:GITHUB_PATH "$($sdk.FullName)\Bin"
+      - name: Vérifier glslc
+        if: steps.wheel.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: glslc --version
+      # vcvars x64 dans l'environnement : le sous-projet vulkan-shaders-gen de
+      # ggml (ExternalProject) configure un CMake enfant qui a besoin de cl.exe
+      # dans le PATH — le générateur Visual Studio du build parent ne suffit pas.
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        if: steps.wheel.outputs.cache-hit != 'true'
+        with:
+          arch: x64
+      - run: uv sync --frozen
+      - name: Build engine wheel (GGML_VULKAN=1, GGML_NATIVE=OFF, AVX2+FMA+F16C+BMI2)
+        shell: pwsh
+        run: |
+          # Test sur le fichier, pas sur cache-hit : robuste à un cache vide
+          # sauvé par un run en échec.
+          if (Get-ChildItem wheelhouse/pywhispercpp-*.whl -ErrorAction SilentlyContinue) {
+            Write-Host "Wheel moteur en cache — build sauté."
+          } else {
+            ./scripts/build_wheel.ps1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      # Sauvegarde IMMÉDIATE : si PyInstaller échoue plus loin, la compilation
+      # de 10 min n'est pas à repayer au prochain run.
+      - name: Save engine wheel
+        if: steps.wheel.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: wheelhouse
+          key: engine-wheel-windows-v2-${{ hashFiles('scripts/build_wheel.ps1', 'uv.lock') }}
+      # Après ce point, TOUJOURS `uv run --no-sync` : un `uv run` synchronisant
+      # restaurerait silencieusement la wheel CPU de PyPI par-dessus la wheel Vulkan.
+      - name: Install engine wheel
+        shell: pwsh
+        run: uv pip install (Get-ChildItem wheelhouse/pywhispercpp-*.whl).FullName --force-reinstall
+      - name: Engine wheel imports and has GPU backend
+        shell: pwsh
+        run: |
+          uv run --no-sync python -c "import _pywhispercpp; from pywhispercpp.model import Model; print('engine import OK')"
+          uv run --no-sync python -c "import glob,sys,zipfile; w=glob.glob('wheelhouse/pywhispercpp-*.whl')[0]; ok=any('ggml-vulkan' in n for n in zipfile.ZipFile(w).namelist()); print('ggml-vulkan dans la wheel:', ok); sys.exit(0 if ok else 1)"
+      - name: Unit tests against the Vulkan wheel
+        run: uv run --no-sync pytest -m "not integration" -q
+      - name: PyInstaller onefile
+        run: uv run --no-sync pyinstaller packaging/ecoutemoi.spec --noconfirm
+      - name: Smoke — single .exe runs without Python
+        shell: pwsh
+        run: |
+          if (Test-Path dist/EcouteMoi/) { Write-Error "onedir produit au lieu du onefile" }
+          # Binaire GUI-subsystem : pwsh ne l'attend pas et $LASTEXITCODE reste
+          # null — Start-Process -Wait donne le vrai code de sortie.
+          $p = Start-Process -FilePath "dist\EcouteMoi.exe" -ArgumentList "--version" `
+              -NoNewWindow -Wait -PassThru -RedirectStandardOutput smoke.txt
+          Get-Content smoke.txt
+          if ($p.ExitCode -ne 0) { Write-Error "exit code $($p.ExitCode)" }
+          if (-not (Select-String -Path smoke.txt -Pattern "EcouteMoi" -Quiet)) {
+              Write-Error "sortie inattendue du smoke test"
+          }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: EcouteMoi-windows-x64
+          path: dist/EcouteMoi.exe
+          compression-level: 0  # onefile PyInstaller déjà compressé
+          retention-days: 7
+
+  linux:
+    name: artifact linux-x86_64 (Vulkan, AppImage)
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04  # plancher de compatibilité glibc 2.35
+    needs: test
+    timeout-minutes: 120
+    steps:
+      # Dépendances TOUJOURS nécessaires : exécution Qt, loader Vulkan dont dépend
+      # libggml-vulkan, empaquetage AppImage — et un compilateur C, car
+      # `uv sync` lui-même construit webrtcvad-wheels depuis les sources (pas de
+      # wheel cp314 publiée). C'est indépendant de la wheel moteur : les mettre
+      # derrière le cache-hit casserait `uv sync` (« command 'cc' failed »).
+      - name: Runtime + packaging deps
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config git curl wget ca-certificates gnupg file \
+            desktop-file-utils zsync libvulkan-dev \
+            libgl1 libegl1 libglib2.0-0 libxkbcommon0 libdbus-1-3 \
+            libfontconfig1 libasound2
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      # La wheel moteur (~8 min de compilation) ne dépend que de la version
+      # pywhispercpp verrouillée et du script de build : cache directe.
+      - name: Restore engine wheel
+        id: wheel
+        uses: actions/cache/restore@v6
+        with:
+          path: wheelhouse
+          key: engine-wheel-linux-v2-${{ hashFiles('scripts/build_wheel.sh', 'uv.lock') }}
+      # cmake + SDK LunarG (glslc, requis pour compiler les shaders Vulkan de
+      # ggml) : ~1 Go d'apt, sautés dès que la wheel est en cache. Canal LunarG
+      # sans numéro de version : dernière release publiée pour jammy.
+      - name: cmake + LunarG glslc
+        if: steps.wheel.outputs.cache-hit != 'true'
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+            | gpg --dearmor > /usr/share/keyrings/lunarg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/lunarg.gpg] https://packages.lunarg.com/vulkan jammy main" \
+            > /etc/apt/sources.list.d/lunarg.list
+          apt-get update
+          apt-get install -y vulkan-sdk
+          glslc --version
+      - run: uv sync --frozen
+      - name: Build engine wheel (GGML_VULKAN=1, GGML_NATIVE=OFF, AVX2+FMA+F16C+BMI2)
+        # Test sur le fichier, pas sur cache-hit : robuste à un cache vide sauvé
+        # par un run en échec.
+        run: |
+          if ls wheelhouse/pywhispercpp-*.whl >/dev/null 2>&1; then
+            echo "Wheel moteur en cache — build sauté."
+          else
+            bash scripts/build_wheel.sh
+          fi
+      - name: Save engine wheel
+        if: steps.wheel.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: wheelhouse
+          key: engine-wheel-linux-v2-${{ hashFiles('scripts/build_wheel.sh', 'uv.lock') }}
+      # Après ce point, TOUJOURS `uv run --no-sync` : un `uv run` synchronisant
+      # restaurerait silencieusement la wheel CPU de PyPI par-dessus la wheel Vulkan.
+      - name: Install engine wheel
+        run: uv pip install wheelhouse/pywhispercpp-*.whl --force-reinstall
+      - name: Engine wheel imports and has GPU backend
+        run: |
+          uv run --no-sync python -c "import _pywhispercpp; from pywhispercpp.model import Model; print('engine import OK')"
+          uv run --no-sync python - <<'EOF'
+          import glob, sys, zipfile
+          wheel = glob.glob("wheelhouse/pywhispercpp-*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          ok = any("libggml-vulkan" in n for n in names)
+          print("libggml-vulkan dans la wheel:", ok)
+          sys.exit(0 if ok else 1)
+          EOF
+      - name: Unit tests against the Vulkan wheel
+        run: uv run --no-sync pytest -m "not integration" -q
+      - name: PyInstaller onedir
+        run: uv run --no-sync pyinstaller packaging/ecoutemoi.spec --noconfirm
+      - name: Smoke — artifact runs without Python
+        run: ./dist/EcouteMoi/EcouteMoi --version
+      - name: AppImage
+        run: bash scripts/make_appimage.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: EcouteMoi-linux-x86_64
+          path: EcouteMoi-linux-x86_64.AppImage
+          compression-level: 0  # squashfs déjà compressé
+          retention-days: 7
+
+  macos:
+    name: artifact macos-arm64 (Metal)
+    runs-on: macos-latest  # Apple Silicon
+    needs: test
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      # La recompilation de la wheel est l'étape la plus chère du pipeline :
+      # même cache que Windows/Linux.
+      - name: Restore engine wheel
+        id: wheel
+        uses: actions/cache/restore@v6
+        with:
+          path: wheelhouse
+          key: engine-wheel-macos-v1-${{ hashFiles('scripts/build_wheel_macos.sh', 'uv.lock') }}
+      - run: uv sync --frozen
+      - name: Build engine wheel (Metal by default on arm64)
+        run: |
+          if ls wheelhouse/pywhispercpp-*.whl >/dev/null 2>&1; then
+            echo "Wheel moteur en cache — build sauté."
+          else
+            bash scripts/build_wheel_macos.sh
+          fi
+      - name: Save engine wheel
+        if: steps.wheel.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: wheelhouse
+          key: engine-wheel-macos-v1-${{ hashFiles('scripts/build_wheel_macos.sh', 'uv.lock') }}
+      # Après ce point, TOUJOURS `uv run --no-sync` : un `uv run` synchronisant
+      # restaurerait silencieusement la wheel CPU de PyPI par-dessus la wheel Metal.
+      - name: Install engine wheel
+        run: uv pip install wheelhouse/pywhispercpp-*.whl --force-reinstall
+      - name: Engine wheel imports (Metal)
+        run: uv run --no-sync python -c "import _pywhispercpp; from pywhispercpp.model import Model; print('engine import OK')"
+      - name: Unit tests against the Metal wheel
+        run: uv run --no-sync pytest -m "not integration" -q
+      - name: Build .app + zip (icns, Info.plist micro, ditto)
+        run: bash scripts/make_macos_app.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: EcouteMoi-macos-arm64
+          path: EcouteMoi-macos-arm64.zip
+          compression-level: 0  # zip déjà compressé
+          retention-days: 7
+
+  # ------------------------------------------------------------------ release
+  # Les artefacts Actions sont toujours re-zippés par GitHub au téléchargement ;
+  # les assets de release, eux, sont servis bruts : l'AppImage et l'exe se
+  # téléchargent directement. Release roulante « latest » mise à jour à chaque
+  # push sur main.
+  #
+  # `push`/`workflow_dispatch` uniquement, jamais `schedule` : republier revient
+  # à supprimer puis recréer le tag `latest`, ce qui casse brièvement tous les
+  # liens de téléchargement. La sonde hebdomadaire construit et vérifie — elle
+  # ne publie pas.
+  release:
+    name: release latest (assets bruts)
+    if: >-
+      github.ref == 'refs/heads/main'
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [windows, linux, macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      # Pas de checkout : `gh release` travaille sur GH_REPO, le dépôt n'est pas
+      # nécessaire localement (~400 Mo d'artefacts suffisent à télécharger).
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      - name: Publier la release « latest »
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          chmod +x artifacts/EcouteMoi-linux-x86_64/*.AppImage
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest \
+            --prerelease \
+            --title "Dernier build (main)" \
+            --notes "Build automatique de \`main\` (${GITHUB_SHA::7}). Artefacts non signés : voir le README pour le premier lancement." \
+            artifacts/EcouteMoi-windows-x64/EcouteMoi.exe \
+            artifacts/EcouteMoi-linux-x86_64/EcouteMoi-linux-x86_64.AppImage \
+            artifacts/EcouteMoi-macos-arm64/EcouteMoi-macos-arm64.zip
