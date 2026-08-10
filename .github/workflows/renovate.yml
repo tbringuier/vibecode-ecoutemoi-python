@@ -68,9 +68,9 @@ jobs:
       # Node récent requis : sans lui, npm retombe sur une version antérieure de
       # Renovate et la config serait validée avec les règles de la mauvaise
       # version.
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
       - name: renovate-config-validator (strict)
         env:
           # Les dépendances transitives de Renovate traînent une dizaine de
