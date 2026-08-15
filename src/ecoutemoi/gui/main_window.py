@@ -112,6 +112,7 @@ def engine_key(s: Settings, channel: ChannelSpec) -> tuple:
         s.backend,
         s.cpu_engine,
         s.cpu_compute_type,
+        bool(s.trim_audio_ctx),
         int(s.gpu_device),
         s.n_threads,
         bool(s.flash_attn),

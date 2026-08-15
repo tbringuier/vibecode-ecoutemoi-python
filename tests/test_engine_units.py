@@ -155,6 +155,7 @@ def _bare_engine(lines: list[str], gpu_device: int = 0) -> WhisperEngine:
     e.flash_attn_active = True
     e.vad_active = True
     e.dropped_params = []
+    e.trim_audio_ctx = True
     e.warmup_ms = [820.0, 310.0]
     return e
 
@@ -212,6 +213,39 @@ def test_gpu_diagnostic_reports_invalid_device_index():
     diag = e.gpu_diagnostic()
     assert "index GPU 5 invalide" in diag
     assert "AMD Radeon" in diag  # liste les périphériques valides
+
+
+# ------------------------------------------------- contexte encodeur (audio_ctx)
+# L'encodeur traite 30 s de mel quoi qu'il arrive : une fenêtre de 9 s paie 21 s
+# de vide à chaque décodage. Tronquer double la vitesse du direct.
+
+
+def test_audio_ctx_shrinks_with_the_window():
+    from ecoutemoi.core.engine import AUDIO_CTX_FULL, AUDIO_CTX_MIN, audio_ctx_for
+
+    assert audio_ctx_for(9.0) < AUDIO_CTX_FULL  # fenêtre de direct : il y a à gagner
+    assert audio_ctx_for(4.0) <= audio_ctx_for(9.0) <= audio_ctx_for(15.0)
+    assert audio_ctx_for(0.5) == AUDIO_CTX_MIN  # plancher, jamais moins
+
+
+def test_audio_ctx_always_covers_the_audio_with_margin():
+    """Le contexte exact (50 trames par seconde) fait partir la sortie en vrille :
+    mesuré, 450 % d'écart sur le texte à 450 trames pour 9 s. La marge n'est pas
+    une précaution de style."""
+    from ecoutemoi.core.engine import ENCODER_FRAMES_PER_S, audio_ctx_for
+
+    for duration in (1.0, 4.0, 6.5, 9.0, 12.0, 20.0):
+        assert audio_ctx_for(duration) >= duration * ENCODER_FRAMES_PER_S * 1.4
+
+
+def test_audio_ctx_is_full_for_file_sized_chunks():
+    """Les passes de transcription de fichiers font 25 s : il n'y a plus rien à
+    tronquer, et y toucher ferait perdre du texte."""
+    from ecoutemoi.core.engine import AUDIO_CTX_FULL, audio_ctx_for
+
+    assert audio_ctx_for(25.0) == AUDIO_CTX_FULL
+    assert audio_ctx_for(30.0) == AUDIO_CTX_FULL
+    assert audio_ctx_for(120.0) == AUDIO_CTX_FULL
 
 
 def test_supported_context_keys_include_gpu_device():

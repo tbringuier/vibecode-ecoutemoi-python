@@ -57,10 +57,28 @@ modèle converti hors ligne, pour du matériel que Vulkan sert déjà.
   erreur — juste un décodage trois fois plus lent, en silence. (C'est arrivé
   pendant ce développement.)
 
+**Contexte d'encodeur adapté à la fenêtre** (whisper.cpp) : l'encodeur traitait
+toujours 30 s de spectrogramme, même pour une fenêtre de 9 s. Le tronquer double
+à triple la vitesse du direct sans perte de qualité — mesuré de bout en bout sur
+deux voix de référence et deux backends :
+
+| échantillon · backend | plein | adapté | gain | WER |
+|---|---|---|---|---|
+| FR · Vulkan | 520 ms | 278 ms | ×1,9 | 6,74 % → 6,38 % |
+| FR · CPU | 2855 ms | 894 ms | ×3,2 | 6,74 % → 6,03 % |
+| EN · Vulkan | 480 ms | 225 ms | ×2,1 | 0,00 % → 0,00 % |
+| EN · CPU | 2711 ms | 826 ms | ×3,3 | 0,00 % → 0,00 % |
+
+Actif par défaut, désactivable dans les réglages avancés. La transcription de
+fichiers est inchangée (ses passes de 25 s utilisent déjà le contexte entier).
+
 **Mesuré puis écarté.** Le décodage par lots de faster-whisper
 (`BatchedInferencePipeline`) sur 258 s d'audio : aucun gain sur `small`, +18 %
 sur `medium` mais WER de 8,5 % à 10,5 %. Le lot sert à remplir un GPU ; sur CPU,
-CTranslate2 sature déjà les cœurs avec une seule séquence.
+CTranslate2 sature déjà les cœurs avec une seule séquence. Élargir le nombre de
+threads sur CPU hybride : 6 P-cores 839 ms, 16 fils 1728 ms — les E-cores
+freinent. Raccourcir l'encodeur de faster-whisper : sans effet, CTranslate2
+rembourre en interne.
 
 ## 1.0.0 — 6 août 2026
 

@@ -275,6 +275,7 @@ def make_engine(
         compute_type=spec.compute_type if wanted_compute in ("", "auto") else wanted_compute,
         beam_size=STREAM_BEAM_SIZE if beam_size is None else max(1, int(beam_size)),
         engine=choice,
+        trim_audio_ctx=bool(getattr(settings, "trim_audio_ctx", True)),
     )
     if subprocess is None:
         subprocess = bool(getattr(settings, "engine_subprocess", False))

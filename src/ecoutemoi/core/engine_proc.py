@@ -336,6 +336,7 @@ def _params_to_dict(params: EngineParams) -> dict:
         "beam_size": int(params.beam_size),
         "engine": params.engine,
         "vad_filter": bool(params.vad_filter),
+        "trim_audio_ctx": bool(params.trim_audio_ctx),
     }
 
 
@@ -356,6 +357,7 @@ def _params_from_dict(data: dict) -> EngineParams:
         beam_size=max(1, int(data.get("beam_size", 1))),
         engine=data.get("engine", "auto"),
         vad_filter=bool(data.get("vad_filter", True)),
+        trim_audio_ctx=bool(data.get("trim_audio_ctx", True)),
     )
 
 

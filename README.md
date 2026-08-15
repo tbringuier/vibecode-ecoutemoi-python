@@ -243,6 +243,31 @@ installation de plusieurs gigaoctets sur la machine de l'utilisateur, ou
 n'accélère que l'encodeur à partir d'un modèle converti hors ligne. Pour un
 matériel que Vulkan sert déjà immédiatement.
 
+### Contexte d'encodeur adapté à la fenêtre
+
+L'encodeur de whisper traite **toujours 30 s** de spectrogramme, même quand on
+ne lui donne que 9 s : les 21 s de vide sont calculées plein tarif, plusieurs
+fois par seconde. Depuis la 2.0 le contexte est tronqué à ce dont la fenêtre a
+besoin (whisper.cpp uniquement — CTranslate2 n'expose pas ce réglage).
+
+Mesuré de bout en bout sur le pipeline complet, `small-q5_1`, 6 énoncés,
+23 décodages, reproductible au millième sur trois passes :
+
+| échantillon · backend | contexte plein | adapté | gain | WER |
+|---|---|---|---|---|
+| FR · Vulkan | 520 ms | **278 ms** | ×1,9 | 6,74 % → 6,38 % |
+| FR · CPU whisper.cpp | 2855 ms | **894 ms** | ×3,2 | 6,74 % → 6,03 % |
+| EN · Vulkan | 480 ms | **225 ms** | ×2,1 | 0,00 % → 0,00 % |
+| EN · CPU whisper.cpp | 2711 ms | **826 ms** | ×3,3 | 0,00 % → 0,00 % |
+
+WER égal ou meilleur dans les quatre cas. La **transcription de fichiers est
+inchangée** : ses passes de 25 s utilisent déjà le contexte entier, la sortie
+est identique octet pour octet.
+
+Les deux voix de référence sont de la synthèse vocale. Si vous constatez des
+mots manquants en fin de phrase sur une vraie captation, la case
+*Réglages avancés → Contexte d'encodeur adapté à la fenêtre* le désactive.
+
 ### Ce qui a été mesuré et écarté
 
 - **Décodage par lots** (`BatchedInferencePipeline` de faster-whisper), sur 258 s
@@ -251,6 +276,13 @@ matériel que Vulkan sert déjà immédiatement.
   CTranslate2 sature déjà les cœurs avec une seule séquence. Non retenu.
 - **Faisceau de décodage sur fichier** (beam 5), même mesure : +35 % de temps
   pour un **WER de 8,5 % à 5,9 %**. Retenu — hors direct, personne n'attend.
+- **Plus de threads sur CPU hybride** : 6 P-cores donnent 839 ms sur une fenêtre
+  de 9 s, 10 fils 988 ms, **16 fils 1728 ms** — deux fois pire. Les E-cores
+  freinent le calcul au lieu de l'aider. La politique « P-cores physiques,
+  jamais le SMT » est confirmée telle quelle.
+- **Raccourcir l'encodeur de faster-whisper** : sans effet (1478 / 1383 /
+  1416 ms pour 30 / 15 / 10 s, soit du bruit). CTranslate2 rembourre en
+  interne — le chemin CPU est à son maximum.
 
 ### Côté machine
 

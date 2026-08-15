@@ -84,6 +84,10 @@ class Settings:
     # Précision de calcul de faster-whisper. « auto » = déduite de la quantization
     # du modèle choisi (q5_* -> int8, q8_0 -> int8_float32, f16 -> float32).
     cpu_compute_type: str = "auto"  # auto | int8 | int8_float32 | float32
+    # Tronquer le contexte de l'encodeur à la durée réellement décodée
+    # (whisper.cpp seulement). ~2x sur le direct, sans perte mesurable — voir
+    # `audio_ctx_for` dans core/engine.py pour le protocole et ses limites.
+    trim_audio_ctx: bool = True
     hallucination_filter: bool = True
     carry_context: bool = False
     # Inférence dans un processus séparé : sort le décodage du processus Qt, donc

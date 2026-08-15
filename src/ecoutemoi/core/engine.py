@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 
 from ecoutemoi.constants import (
+    TARGET_SR,
     VAD_MIN_SILENCE_MS,
     VAD_MIN_SPEECH_MS,
     VAD_SAMPLES_OVERLAP,
@@ -131,6 +132,49 @@ def centi_to_ms(t: int | float) -> int:
     return round(t * 10)
 
 
+# --- Contexte de l'encodeur (audio_ctx) ---------------------------------------
+# L'encodeur de whisper traite TOUJOURS 30 s de mel, soit 1500 trames, quelle que
+# soit la durée réellement fournie. Une fenêtre de direct de 9 s n'en occupe que
+# 450 : les 21 s de vide qui suivent sont encodées plein tarif, à CHAQUE décodage,
+# plusieurs fois par seconde. `audio_ctx` tronque ce contexte.
+#
+# Mesuré de bout en bout sur le vrai pipeline (132 s FR / 125 s EN, 6 énoncés,
+# `small-q5_1`, 23 décodages, reproductible au millième sur trois passes) :
+#
+#   fenêtre 9 s -> 704   Vulkan  525 -> 277 ms (×1,9)   CPU  2695 -> 917 ms (×2,9)
+#   WER FR       6,74 % -> 6,38 %      WER EN  0,00 % -> 0,00 %
+#
+# Deux bornes, apprises par la mesure et non par le raisonnement :
+# - PLANCHER. Le contexte ne peut pas descendre à la durée exacte : 450 trames
+#   pour 9 s d'audio font partir la sortie en vrille (450 % d'écart mesuré).
+#   D'où la marge de 50 % et le plancher de 512.
+# - PLAFOND UTILE. Au-delà de ~800 le gain est déjà acquis, et certaines valeurs
+#   dégradent un énoncé sur six du passage FR (17 % de WER à 832) sans que le
+#   passage EN bouge d'un mot. La marge de 1,5 est la seule propre sur les DEUX
+#   échantillons — c'est ce qui la fait choisir, pas une théorie.
+#
+# Les deux échantillons sont de la synthèse vocale : à re-vérifier sur une vraie
+# captation de conférence avant de tenir ces chiffres pour définitifs.
+ENCODER_FRAMES_PER_S = 50  # 1500 trames pour 30 s
+AUDIO_CTX_FULL = 1500
+AUDIO_CTX_MIN = 512  # sous ce seuil le gain plafonne et la sortie se dégrade
+AUDIO_CTX_MARGIN = 1.5  # marge au-dessus de la durée réellement fournie
+AUDIO_CTX_STEP = 64  # arrondi : les tailles alignées tombent sur des noyaux rapides
+
+
+def audio_ctx_for(duration_s: float) -> int:
+    """Taille de contexte encodeur adaptée à cette durée (1500 = pleine).
+
+    Calculée au DÉCODAGE, pas au chargement : la fenêtre du direct respire entre
+    4 et 9 s selon la charge, et un contexte figé sur le pire cas laisserait la
+    moitié du gain sur la table. Au-delà de ~20 s (transcription de fichiers) le
+    contexte redevient plein : il n'y a plus rien à tronquer.
+    """
+    needed = duration_s * ENCODER_FRAMES_PER_S * AUDIO_CTX_MARGIN
+    steps = -(-int(needed) // AUDIO_CTX_STEP)  # arrondi supérieur
+    return max(AUDIO_CTX_MIN, min(AUDIO_CTX_FULL, steps * AUDIO_CTX_STEP))
+
+
 def gpu_backend_libs() -> list[str]:
     """Noms des libs backend GPU (ggml-vulkan/metal) livrées à côté du moteur.
 
@@ -231,6 +275,7 @@ class WhisperEngine(WarmupMixin):
         self.load_s = 0.0
         self.last_decode_ms = 0.0
         self.warmup_ms: list[float] = []
+        self.trim_audio_ctx = bool(params.trim_audio_ctx) and "audio_ctx" in (self._schema_keys() or ())
         self.fallback_reason: str | None = None  # posé par core/engines si repli
         self._gpu_requested = False
         self._model = None
@@ -429,8 +474,11 @@ class WhisperEngine(WarmupMixin):
     def transcribe(self, audio: np.ndarray) -> list[Segment]:
         """Decode one float32 mono 16 kHz window; returns segments in ms."""
         assert self._model is not None
+        extra: dict = {}
+        if self.trim_audio_ctx:
+            extra["audio_ctx"] = audio_ctx_for(len(audio) / TARGET_SR)
         t0 = time.perf_counter()
-        raw = self._model.transcribe(audio)
+        raw = self._model.transcribe(audio, **extra)
         self.last_decode_ms = (time.perf_counter() - t0) * 1000.0
         out: list[Segment] = []
         for s in raw:
@@ -546,6 +594,7 @@ class WhisperEngine(WarmupMixin):
             "chargement_s": round(self.load_s, 2),
             "prechauffage_ms": [round(t) for t in self.warmup_ms],
             "flash_attn": self.flash_attn_active,
+            "audio_ctx_adaptatif": self.trim_audio_ctx,
             "vad": self.vad_active,
             "threads": self.n_threads,
             "params_ignores": self.dropped_params,
@@ -599,6 +648,7 @@ __all__ = [
     "EngineParams",
     "Segment",
     "WhisperEngine",
+    "audio_ctx_for",
     "backend_attempts",
     "centi_to_ms",
     "gpu_backend_libs",

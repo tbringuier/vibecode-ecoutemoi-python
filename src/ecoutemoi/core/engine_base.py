@@ -80,6 +80,9 @@ class EngineParams:
     beam_size: int = 1  # 1 = glouton (direct) ; 5 = transcription de fichiers
     engine: str = "auto"  # auto | whispercpp | faster-whisper
     vad_filter: bool = True  # VAD Silero interne du moteur
+    # Tronquer le contexte de l'encodeur à la durée réellement fournie
+    # (whisper.cpp seulement — voir `audio_ctx_for` dans core/engine.py).
+    trim_audio_ctx: bool = True
 
 
 # Le prompt initial de whisper est PLAFONNÉ à la moitié de la fenêtre de texte du
