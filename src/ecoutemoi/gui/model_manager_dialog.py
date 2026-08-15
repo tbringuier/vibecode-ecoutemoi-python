@@ -1,6 +1,12 @@
 """Model manager: registry table, parallel downloads (pool 2) with real
 per-file progress + MB/s, RAM warning.
 
+DEUX formats depuis la 2.0 (ggml pour le GPU, CTranslate2 pour le CPU), et un
+sélecteur plutôt que deux jeux de colonnes : doubler barre de progression et
+bouton sur chaque ligne rendrait le tableau illisible pour un choix qu'on ne
+fait qu'une fois. La colonne « Installé » montre en permanence les DEUX, pour
+qu'on ne découvre pas au démarrage qu'il manque le format de l'autre backend.
+
 Progression : PIÈGE tqdm — avec `disable=True` (pas de sortie console),
 `tqdm.update()` sort immédiatement SANS incrémenter `self.n` : lire `self.n`
 donnait « 0 % 0.0 Mo/s » en permanence. On compte donc les octets NOUS-MÊMES
@@ -19,6 +25,7 @@ from pathlib import Path
 import psutil
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
@@ -32,11 +39,12 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from ecoutemoi.constants import MODEL_FORMAT_LABELS, MODEL_FORMATS
 from ecoutemoi.core import models
 
 log = logging.getLogger(__name__)
 
-COL_KEY, COL_QUANT, COL_SIZE, COL_TRAD, COL_RAM, COL_STATE, COL_ACTION = range(7)
+COL_KEY, COL_QUANT, COL_SIZE, COL_TRAD, COL_RAM, COL_HAVE, COL_STATE, COL_ACTION = range(8)
 
 
 def _make_qt_tqdm(cb):
@@ -77,16 +85,16 @@ class DownloadManager(QObject):
     def busy(self) -> bool:
         return self._pending > 0
 
-    def download(self, keys: list[str]) -> None:
+    def download(self, keys: list[str], fmt: str = models.FMT_GGML) -> None:
         if self._pool is None:
             self._pool = ThreadPoolExecutor(max_workers=models.DOWNLOAD_POOL)
         for key in keys:
             self._pending += 1
-            self._pool.submit(self._one, key)
+            self._pool.submit(self._one, key, fmt)
 
-    def _one(self, key: str) -> None:
+    def _one(self, key: str, fmt: str) -> None:
         spec = models.REGISTRY[key]
-        expected = spec.size_mb * 1024 * 1024
+        expected = spec.size_mb_for(fmt) * 1024 * 1024
         seen = {"t": time.monotonic(), "prev": 0}
 
         def report(nbytes: int) -> None:
@@ -100,11 +108,12 @@ class DownloadManager(QObject):
             self.sig_progress.emit(key, int(pct), speed)
 
         try:
-            models.download_model(spec, tqdm_class=_make_qt_tqdm(report))
-            models.ensure_vad_model()  # mandatory companion model
+            models.download(spec, fmt, tqdm_class=_make_qt_tqdm(report))
+            if fmt == models.FMT_GGML:
+                models.ensure_vad_model()  # VAD ggml : whisper.cpp seul en a besoin
             self.sig_done.emit(key, True, "")
         except Exception as exc:
-            log.exception("Download failed: %s", key)
+            log.exception("Download failed: %s (%s)", key, fmt)
             self.sig_done.emit(key, False, str(exc))
         finally:
             self._pending -= 1
@@ -115,18 +124,34 @@ class DownloadManager(QObject):
 class ModelManagerDialog(QDialog):
     """« Gérer les modèles… » — download + RAM estimates."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, fmt: str | None = None):
         super().__init__(parent)
         self.setWindowTitle("Gérer les modèles")
-        self.resize(900, 560)
+        self.resize(980, 580)
         self.manager = DownloadManager(self)
         self.manager.sig_progress.connect(self._on_progress)
         self.manager.sig_done.connect(self._on_done)
         self._downloading: set[str] = set()
+        self._fmt = fmt if fmt in MODEL_FORMATS else self._default_format()
 
-        self.table = QTableWidget(len(models.REGISTRY), 7, self)
+        self.format_combo = QComboBox()
+        for key in MODEL_FORMATS:
+            self.format_combo.addItem(MODEL_FORMAT_LABELS[key], key)
+        self.format_combo.setCurrentIndex(max(0, self.format_combo.findData(self._fmt)))
+        self.format_combo.setToolTip(
+            "Chaque moteur a son format de poids et ne sait pas lire celui de "
+            "l'autre :\n"
+            "• ggml — whisper.cpp, le moteur GPU (Vulkan / Metal) ;\n"
+            "• CTranslate2 — faster-whisper, le moteur CPU.\n\n"
+            "Un dossier CTranslate2 est PARTAGÉ par toutes les quantizations "
+            "d'une même famille : télécharger small-q5_1 installe aussi "
+            "small-q8_0 et small."
+        )
+        self.format_combo.currentIndexChanged.connect(self._format_changed)
+
+        self.table = QTableWidget(len(models.REGISTRY), 8, self)
         self.table.setHorizontalHeaderLabels(
-            ["Modèle", "Quantization", "Taille", "Trad. EN", "RAM est.", "État", ""]
+            ["Modèle", "Quantization", "Taille", "Trad. EN", "RAM est.", "Installé", "État", ""]
         )
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -143,7 +168,8 @@ class ModelManagerDialog(QDialog):
             short, detail = models.QUANT_NOTES.get(spec.quant, ("", ""))
             quant.setToolTip(f"{short}\n\n{detail}" if detail else "")
             self.table.setItem(row, COL_QUANT, quant)
-            self.table.setItem(row, COL_SIZE, QTableWidgetItem(f"{spec.size_mb} Mo"))
+            self.table.setItem(row, COL_SIZE, QTableWidgetItem(""))
+            self.table.setItem(row, COL_HAVE, QTableWidgetItem(""))
             trad = QTableWidgetItem("oui" if spec.translate else "non")
             if not spec.translate:
                 trad.setToolTip(
@@ -170,11 +196,14 @@ class ModelManagerDialog(QDialog):
         self._hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         btn_quant = QPushButton("Quantizations — aide-mémoire…")
         btn_quant.clicked.connect(lambda: QuantizationHelpDialog(self).exec())
-        btn_import = QPushButton("Importer un fichier…")
+        btn_import = QPushButton("Importer un .bin ggml…")
         btn_import.setToolTip(
-            "Installe un .bin obtenu ailleurs (clé USB, miroir interne). Le nom du "
-            "fichier doit être celui du registre — il identifie le modèle — et le "
-            "contenu est validé (magie ggml + taille) avant installation."
+            "Installe un .bin ggml obtenu ailleurs (clé USB, miroir interne). Le nom "
+            "du fichier doit être celui du registre — il identifie le modèle — et le "
+            "contenu est validé (magie ggml + taille) avant installation.\n\n"
+            "Un modèle CTranslate2 est un DOSSIER, pas un fichier : pour l'installer "
+            "hors ligne, copiez-le dans models/ct2/<famille>/ (bouton « Ouvrir le "
+            "dossier »)."
         )
         btn_import.clicked.connect(self._import_file)
         btn_dir = QPushButton("Ouvrir le dossier")
@@ -188,15 +217,40 @@ class ModelManagerDialog(QDialog):
         row.addWidget(btn_dir)
         row.addStretch(1)
         row.addWidget(buttons)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Format :"))
+        top.addWidget(self.format_combo, 1)
         lay = QVBoxLayout(self)
+        lay.addLayout(top)
         lay.addWidget(self.table, 1)
         lay.addWidget(self._hint)
         lay.addLayout(row)
         self._refresh_hint()
         self._refresh_states()
 
+    @staticmethod
+    def _default_format() -> str:
+        """Le format dont le backend réglé a besoin — celui qu'on vient chercher."""
+        try:
+            from ecoutemoi.cli import plan_engine
+            from ecoutemoi.config import load_settings
+
+            _choice, fmt = plan_engine(load_settings())
+            return fmt
+        except Exception:  # sondage impossible : le format historique fait un défaut sûr
+            log.debug("Format par défaut indéterminé — repli ggml", exc_info=True)
+            return models.FMT_GGML
+
+    def _format_changed(self) -> None:
+        self._fmt = self.format_combo.currentData() or models.FMT_GGML
+        self._refresh_hint()
+        self._refresh_states()
+
     def _refresh_hint(self) -> None:
-        self._hint.setText(f"Dossier des modèles : {models.models_dir()}")
+        engine = "whisper.cpp (GPU)" if self._fmt == models.FMT_GGML else "faster-whisper (CPU)"
+        self._hint.setText(
+            f"Dossier des modèles : {models.models_dir()} · format affiché : {self._fmt} — moteur {engine}."
+        )
 
     def _open_models_dir(self) -> None:
         from ecoutemoi.gui.desktop import open_path
@@ -238,14 +292,29 @@ class ModelManagerDialog(QDialog):
 
     # ------------------------------------------------------------------ state
     def _refresh_states(self) -> None:
-        installed = set(models.installed_models())
+        installed = set(models.installed_models(fmt=self._fmt))
         for key, row in self._rows.items():
+            spec = models.REGISTRY[key]
+            have = models.installed_formats(spec)
+            item_have = self.table.item(row, COL_HAVE)
+            item_have.setText(" + ".join(have) if have else "—")
+            item_have.setToolTip("ggml = whisper.cpp (GPU Vulkan/Metal)\nct2 = faster-whisper (CPU)")
+            size_item = self.table.item(row, COL_SIZE)
+            if spec.supports(self._fmt):
+                size_item.setText(f"{spec.size_mb_for(self._fmt)} Mo")
+            else:
+                size_item.setText("indisponible")
             if key in self._downloading:
                 continue  # ne pas écraser une barre de téléchargement en cours
             bar: QProgressBar = self.table.cellWidget(row, COL_STATE)
             btn: QPushButton = self.table.cellWidget(row, COL_ACTION)
             bar.setRange(0, 100)
-            if key in installed:
+            btn.setEnabled(spec.supports(self._fmt))
+            if not spec.supports(self._fmt):
+                bar.setValue(0)
+                bar.setFormat("non publié")
+                btn.setText("—")
+            elif key in installed:
                 bar.setValue(100)
                 bar.setFormat("installé")
                 btn.setText("Re-télécharger")
@@ -262,7 +331,7 @@ class ModelManagerDialog(QDialog):
         btn.setEnabled(False)
         btn.setText("Téléchargement…")
         bar.setRange(0, 0)  # indéterminé tant qu'aucun octet n'est observé
-        self.manager.download([key])
+        self.manager.download([key], self._fmt)
 
     def _on_progress(self, key: str, pct: int, mbps: float) -> None:
         bar: QProgressBar = self.table.cellWidget(self._rows[key], COL_STATE)
@@ -298,11 +367,17 @@ def quantization_cheatsheet_html() -> str:
     for family, specs in families.items():
         variants = " · ".join(f"<code>{s.quant}</code> {s.size_mb} Mo" for s in specs)
         trad = "oui" if specs[0].translate else "<b>NON</b>"
+        ct2 = f"{specs[0].ct2_size_mb} Mo" if specs[0].ct2_repo else "—"
         model_rows += (
-            f"<tr><td><b>{family}</b></td><td>{variants}</td>"
+            f"<tr><td><b>{family}</b></td><td>{variants}</td><td>{ct2}</td>"
             f"<td>~{min(s.ram_gb for s in specs):.1f}–{max(s.ram_gb for s in specs):.1f} Go</td>"
             f"<td>{trad}</td></tr>"
         )
+    compute_rows = "".join(
+        f"<tr><td><code>{q}</code></td><td><code>{models.QUANT_TO_COMPUTE[q]}</code></td></tr>"
+        for q in models.QUANT_ORDER
+        if q in models.QUANT_TO_COMPUTE
+    )
 
     return f"""
 <h2>Quantizations — aide-mémoire</h2>
@@ -313,6 +388,20 @@ rapide — et la qualité baisse un peu. La perte ne se répartit pas
 uniformément : elle frappe d'abord les <b>noms propres, les acronymes et les
 mots rares</b>, exactement ce qui compte en conférence technique. D'où le
 <b>Lexique de la conférence</b> (Réglages), qui compense sur ces mots-là.</p>
+
+<h3>Deux moteurs, deux formats</h3>
+<p>Le GPU (Vulkan / Metal) tourne sous <b>whisper.cpp</b>, au format
+<code>ggml</code> : un fichier par quantization, exactement comme ci-dessous.
+Le CPU tourne sous <b>faster-whisper</b>, au format <b>CTranslate2</b>, où la
+quantization n'est pas un fichier mais un <i>type de calcul</i> choisi au
+chargement. Conséquence pratique : <b>un seul téléchargement CTranslate2 par
+famille</b> sert toutes ses quantizations, et la correspondance est celle-ci —</p>
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>ggml</th><th>CTranslate2</th></tr>
+{compute_rows}
+</table>
+<p>CTranslate2 ne descend pas sous 8 bits : <code>q5_0</code> et
+<code>q5_1</code> y arrivent donc tous deux sur <code>int8</code>.</p>
 
 <h3>Les variantes proposées</h3>
 <table border="1" cellpadding="6" cellspacing="0" width="100%">
@@ -332,7 +421,8 @@ quantization la plus compacte à qualité acceptable, soit <code>q5_1</code>
 <code>f16</code> n'a d'intérêt que pour mesurer la perte des autres.</li>
 <li><b>Ne devinez pas</b> : <i>Outils → Benchmark — Tester ma machine…</i>
 mesure RTF (vitesse) <i>et</i> WER (qualité) de chaque variante installée sur
-VOTRE machine, et refuse celles qui ne tiennent pas le direct.</li>
+VOTRE machine, avec le moteur qui tournera vraiment, et refuse celles qui ne
+tiennent pas le direct.</li>
 </ul>
 
 <h3>Ce que la quantization ne change PAS</h3>
@@ -343,9 +433,14 @@ seule.</p>
 
 <h3>Familles disponibles</h3>
 <table border="1" cellpadding="6" cellspacing="0" width="100%">
-<tr><th>Famille</th><th>Variantes</th><th>RAM estimée</th><th>Traduction</th></tr>
+<tr><th>Famille</th><th>Variantes ggml</th><th>CTranslate2</th><th>RAM estimée</th>
+<th>Traduction</th></tr>
 {model_rows}
 </table>
+<p>Le dossier CTranslate2 est plus gros que le <code>.bin</code> ggml : le dépôt
+amont publie des poids en demi-précision, quantifiés <i>au chargement</i>. Ce
+sont des octets téléchargés, pas de la mémoire à l'exécution — en
+<code>int8</code>, comptez environ la moitié en RAM.</p>
 
 <h3>Pièges</h3>
 <ul>

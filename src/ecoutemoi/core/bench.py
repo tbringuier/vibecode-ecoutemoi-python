@@ -152,11 +152,23 @@ def run_pass(
 ) -> dict:
     """One (model, wav, task) pass in a subprocess. Hard timeout = startup + 3x audio.
     Returns the worker dict, or {"ok": False, "aborted": True/False, "error": ...}."""
+    from ecoutemoi.cli import STREAM_BEAM_SIZE, plan_engine, resolve_model_paths
+    from ecoutemoi.config import load_settings
+
     duration = wav_duration_s(wav_path)
     timeout = pass_timeout_s(duration)
     spec = models.REGISTRY[model_key]
+    # Le banc doit mesurer LE moteur qui tournera en session pour ce backend :
+    # mesurer whisper.cpp puis faire tourner faster-whisper produirait un RTF
+    # sans rapport avec ce que l'opérateur vivra devant sa salle.
+    choice, _fmt = plan_engine(load_settings(), backend=backend)
+    ggml, ct2 = resolve_model_paths(spec, choice)
     task = {
-        "model_path": str(models.model_path(spec)),
+        "model_path": str(ggml) if ggml else None,
+        "ct2_path": str(ct2) if ct2 else None,
+        "engine": choice,
+        "compute_type": spec.compute_type,
+        "beam_size": STREAM_BEAM_SIZE,  # le banc mesure le DIRECT : décodage glouton
         "vad_model_path": None,
         "wav_path": str(wav_path),
         "language": language,
@@ -310,20 +322,25 @@ def load_results(path: Path | None = None) -> dict | None:
 def worker_main(task_path: str, out_path: str) -> int:
     """Runs inside the bench subprocess; file-based I/O (safe when stdout is None)."""
     from ecoutemoi.cli import load_wav, resample_to_16k
-    from ecoutemoi.core.engine import EngineParams, WhisperEngine
+    from ecoutemoi.core.engine_base import EngineParams
+    from ecoutemoi.core.engines import create_engine
 
     task = json.loads(Path(task_path).read_text(encoding="utf-8"))
     x, sr = load_wav(Path(task["wav_path"]))
     audio = resample_to_16k(x, sr)
     params = EngineParams(
-        model_path=Path(task["model_path"]),
+        model_path=Path(task["model_path"]) if task.get("model_path") else None,
         language=task["language"],
         translate=bool(task.get("translate", False)),
         backend=str(task.get("backend", "auto")),
         vad_model_path=Path(task["vad_model_path"]) if task.get("vad_model_path") else None,
         gpu_device=max(0, int(task.get("gpu_device", 0) or 0)),
+        ct2_path=Path(task["ct2_path"]) if task.get("ct2_path") else None,
+        compute_type=str(task.get("compute_type", "int8")),
+        beam_size=max(1, int(task.get("beam_size", 1))),
+        engine=str(task.get("engine", "auto")),
     )
-    engine = WhisperEngine(params)
+    engine = create_engine(params)
     try:
         engine.transcribe(audio[:16000])  # warmup: graph allocation etc.
         t0 = time.perf_counter()

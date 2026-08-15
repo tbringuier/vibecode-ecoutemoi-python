@@ -81,6 +81,15 @@ def test_backend_auto_same_ladder_as_gpu():
     assert backend_attempts("auto", True) == backend_attempts("gpu", True)
 
 
+def test_backend_gpu_only_has_no_cpu_safety_net():
+    """C'est ce que demande core/engines.py en mode auto : si le GPU ne répond
+    pas, le repli doit être faster-whisper (3x plus rapide sur CPU), pas le CPU
+    de whisper.cpp. Un barreau CPU ici masquerait l'échec."""
+    attempts = backend_attempts("gpu-only", flash_attn=True)
+    assert [name for name, _ in attempts] == ["full", "no-flash"]
+    assert all(ctx["use_gpu"] is True for _, ctx in attempts)
+
+
 def test_backend_ladder_dedupes_when_flash_off():
     attempts = backend_attempts("auto", flash_attn=False)
     assert [name for name, _ in attempts] == ["full", "cpu"]  # no-flash duplicate dropped

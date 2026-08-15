@@ -12,7 +12,14 @@ from pathlib import Path
 
 import platformdirs
 
-from ecoutemoi.constants import APP_NAME, DEFAULT_MODEL, DEFAULT_PRESET, PRESETS
+from ecoutemoi.constants import (
+    APP_NAME,
+    CPU_ENGINES,
+    DEFAULT_MODEL,
+    DEFAULT_PRESET,
+    ENGINE_FASTER_WHISPER,
+    PRESETS,
+)
 
 log = logging.getLogger(__name__)
 
@@ -70,6 +77,13 @@ class Settings:
     flash_attn: bool = True
     backend: str = "auto"  # auto | gpu | cpu
     gpu_device: int = 0  # index du périphérique Vulkan/Metal (multi-GPU)
+    # Moteur employé quand le décodage tombe sur le CPU. faster-whisper
+    # (CTranslate2) y est ~3x plus rapide que whisper.cpp sur `small` ; whisper.cpp
+    # reste proposé comme repli si faster-whisper pose problème sur une machine.
+    cpu_engine: str = ENGINE_FASTER_WHISPER  # faster-whisper | whispercpp
+    # Précision de calcul de faster-whisper. « auto » = déduite de la quantization
+    # du modèle choisi (q5_* -> int8, q8_0 -> int8_float32, f16 -> float32).
+    cpu_compute_type: str = "auto"  # auto | int8 | int8_float32 | float32
     hallucination_filter: bool = True
     carry_context: bool = False
     # Inférence dans un processus séparé : sort le décodage du processus Qt, donc
@@ -188,6 +202,12 @@ def load_settings(path: Path | None = None) -> Settings:
     if settings.backend not in ("auto", "gpu", "cpu"):
         log.warning("Backend inconnu %r, retour à 'auto'", settings.backend)
         settings.backend = "auto"
+    if settings.cpu_engine not in CPU_ENGINES:
+        log.warning("Moteur CPU inconnu %r, retour à %r", settings.cpu_engine, ENGINE_FASTER_WHISPER)
+        settings.cpu_engine = ENGINE_FASTER_WHISPER
+    if settings.cpu_compute_type not in ("auto", "int8", "int8_float32", "float32"):
+        log.warning("Type de calcul CPU inconnu %r, retour à 'auto'", settings.cpu_compute_type)
+        settings.cpu_compute_type = "auto"
     try:  # settings.json édité à la main : ne jamais laisser passer un index absurde
         settings.gpu_device = max(0, int(settings.gpu_device))
     except TypeError, ValueError:

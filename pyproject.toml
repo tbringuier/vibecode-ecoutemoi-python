@@ -5,13 +5,16 @@ build-backend = "hatchling.build"
 [project]
 name = "ecoutemoi"
 dynamic = ["version"]
-description = "Écoute Moi — sous-titrage temps réel local et transcription de fichiers (whisper.cpp : Vulkan / Metal / CPU)"
+description = "Écoute Moi — sous-titrage temps réel local et transcription de fichiers (faster-whisper au CPU, whisper.cpp au GPU Vulkan / Metal)"
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 authors = [{ name = "Tristan Bringuier" }]
-keywords = ["sous-titres", "subtitles", "whisper", "transcription", "accessibilité", "OBS"]
+keywords = [
+    "sous-titres", "subtitles", "whisper", "faster-whisper", "transcription",
+    "accessibilité", "OBS",
+]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: X11 Applications :: Qt",
@@ -23,7 +26,12 @@ classifiers = [
     "Topic :: Adaptive Technologies",
 ]
 dependencies = [
+    # Deux moteurs, chacun là où il gagne (voir src/ecoutemoi/core/engines.py) :
+    # whisper.cpp est le seul à parler Vulkan/Metal, faster-whisper est ~3x plus
+    # rapide sur CPU. faster-whisper tire ctranslate2, tokenizers, onnxruntime
+    # (VAD Silero interne) et av.
     "pywhispercpp>=1.5.0",
+    "faster-whisper>=1.2.1",
     "sounddevice>=0.5.5",
     "soxr>=1.1",
     "soundfile>=0.14",

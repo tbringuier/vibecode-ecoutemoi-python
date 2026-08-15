@@ -43,10 +43,13 @@ def _profile(monkeypatch, cores: int, ram_gb: float) -> str:
 
 def test_recommended_model_big_machine(monkeypatch):
     assert _profile(monkeypatch, 8, 16) == "small-q5_1"
+    # Seuil descendu à 6 cœurs en 2.0 : faster-whisper décode `small` à RTF ≈ 10
+    # sur 6 P-cores, là où whisper.cpp plafonnait à 3.
+    assert _profile(monkeypatch, 6, 16) == "small-q5_1"
 
 
 def test_recommended_model_mid_machine(monkeypatch):
-    assert _profile(monkeypatch, 6, 16) == "base-q5_1"
+    assert _profile(monkeypatch, 4, 16) == "base-q5_1"
     assert _profile(monkeypatch, 8, 6) == "base-q5_1"
 
 

@@ -115,14 +115,16 @@ class _Runner(QObject):
         self._thread.start()
 
     def _run(self, settings, paths, model_key, mode, formats, out_dir, timestamps) -> None:
-        from ecoutemoi.cli import make_engine
+        from ecoutemoi.cli import FILE_BEAM_SIZE, make_engine
         from ecoutemoi.core import filejob
 
         engine = None
         ok = failed = 0
         try:
             self._emit(self.sig_loading, f"Chargement du modèle {model_key}…")
-            engine = make_engine(settings, model_key, mode)
+            # Hors direct, personne n'attend : on paie un faisceau plus large
+            # pour un texte meilleur (sans effet sur whisper.cpp, glouton).
+            engine = make_engine(settings, model_key, mode, beam_size=FILE_BEAM_SIZE)
             self._emit(self.sig_loading, "")
             written: set[Path] = set()
 

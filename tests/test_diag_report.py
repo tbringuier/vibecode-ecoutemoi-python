@@ -15,8 +15,18 @@ def test_diag_environment_header_is_self_contained():
     lines, _ = diag_report(_args(model="nexistepas"), Settings())
     text = "\n".join(lines)
     # tout ce qu'un rapport de bug doit contenir sans question de relance
-    for needle in ("diagnostic", "OS ", "Python", "Config", "Log", "Modèles", "Libs backend GPU"):
+    for needle in ("diagnostic", "OS ", "Python", "Config", "Log", "Modèles", "libs backend GPU"):
         assert needle in text
+
+
+def test_diag_reports_both_engines():
+    """2.0 : deux moteurs, deux formats de modèle. Un rapport qui ne dirait pas
+    lequel tourne ni ce qui est installé pour l'autre serait inexploitable."""
+    lines, _ = diag_report(_args(model="nexistepas"), Settings())
+    text = "\n".join(lines)
+    assert "whisper.cpp" in text
+    assert "faster-whisper" in text
+    assert "Sondage GPU" in text
 
 
 def test_diag_unknown_model_fails_clearly():

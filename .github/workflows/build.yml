@@ -85,6 +85,13 @@ jobs:
         run: uv run --no-sync pytest -m "not integration" -q
       - name: Smoke — ecoutemoi --version
         run: uv run --no-sync ecoutemoi --version
+      # Les DEUX moteurs doivent être là. Un environnement où faster-whisper
+      # manque démarre, transcrit et passe les tests — trois fois plus lentement
+      # sur CPU, sans que rien ne le signale.
+      - name: Smoke — les deux moteurs sont importables
+        run: |
+          uv run --no-sync python -c "import _pywhispercpp; from pywhispercpp.model import Model; print('whisper.cpp OK')"
+          uv run --no-sync python -c "import ctranslate2, faster_whisper; print('faster-whisper', faster_whisper.__version__, 'ctranslate2', ctranslate2.__version__, ctranslate2.get_supported_compute_types('cpu'))"
 
   # Tests d'intégration : téléchargement de modèle + inférence CPU réelle +
   # flux de 10 min + GUI offscreen. En parallèle des artefacts, pas devant eux.
@@ -109,7 +116,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.local/share/EcouteMoi/models
-          key: whisper-models-integration-v1
+          key: whisper-models-integration-v2  # v2 : le dossier contient aussi ct2/
       - run: uv sync --frozen
       - name: Integration tests
         env:
@@ -197,6 +204,7 @@ jobs:
         run: |
           uv run --no-sync python -c "import _pywhispercpp; from pywhispercpp.model import Model; print('engine import OK')"
           uv run --no-sync python -c "import glob,sys,zipfile; w=glob.glob('wheelhouse/pywhispercpp-*.whl')[0]; ok=any('ggml-vulkan' in n for n in zipfile.ZipFile(w).namelist()); print('ggml-vulkan dans la wheel:', ok); sys.exit(0 if ok else 1)"
+          uv run --no-sync python -c "import ctranslate2, faster_whisper; print('moteur CPU:', faster_whisper.__version__, ctranslate2.get_supported_compute_types('cpu'))"
       - name: Unit tests against the Vulkan wheel
         run: uv run --no-sync pytest -m "not integration" -q
       - name: PyInstaller onefile
@@ -214,6 +222,17 @@ jobs:
           if (-not (Select-String -Path smoke.txt -Pattern "EcouteMoi" -Quiet)) {
               Write-Error "sortie inattendue du smoke test"
           }
+      # Aucun garde-fou binaire ne détecte une exclusion PyInstaller qui casse
+      # une chaîne d'imports Python : le bundle démarre, transcrit, et décode
+      # trois fois plus lentement en silence. Seul un contrôle APRÈS empaquetage
+      # le voit.
+      - name: Smoke — les deux moteurs dans le binaire
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\EcouteMoi.exe" -ArgumentList "--check-engines" `
+              -NoNewWindow -Wait -PassThru -RedirectStandardOutput engines.txt -RedirectStandardError engines.err
+          Get-Content engines.txt, engines.err
+          if ($p.ExitCode -ne 0) { Write-Error "un moteur manque dans le bundle" }
       - uses: actions/upload-artifact@v7
         with:
           name: EcouteMoi-windows-x64
@@ -301,12 +320,17 @@ jobs:
           print("libggml-vulkan dans la wheel:", ok)
           sys.exit(0 if ok else 1)
           EOF
+          uv run --no-sync python -c "import ctranslate2, faster_whisper; print('moteur CPU:', faster_whisper.__version__, ctranslate2.get_supported_compute_types('cpu'))"
       - name: Unit tests against the Vulkan wheel
         run: uv run --no-sync pytest -m "not integration" -q
       - name: PyInstaller onedir
         run: uv run --no-sync pyinstaller packaging/ecoutemoi.spec --noconfirm
       - name: Smoke — artifact runs without Python
         run: ./dist/EcouteMoi/EcouteMoi --version
+      # Voir la note du job windows : une exclusion PyInstaller qui casse un
+      # import ne se voit qu'ici.
+      - name: Smoke — les deux moteurs dans le binaire
+        run: ./dist/EcouteMoi/EcouteMoi --check-engines
       - name: AppImage
         run: bash scripts/make_appimage.sh
       - uses: actions/upload-artifact@v7
@@ -355,12 +379,18 @@ jobs:
       # restaurerait silencieusement la wheel CPU de PyPI par-dessus la wheel Metal.
       - name: Install engine wheel
         run: uv pip install wheelhouse/pywhispercpp-*.whl --force-reinstall
-      - name: Engine wheel imports (Metal)
-        run: uv run --no-sync python -c "import _pywhispercpp; from pywhispercpp.model import Model; print('engine import OK')"
+      - name: Engine wheel imports (Metal) + moteur CPU
+        run: |
+          uv run --no-sync python -c "import _pywhispercpp; from pywhispercpp.model import Model; print('engine import OK')"
+          uv run --no-sync python -c "import ctranslate2, faster_whisper; print('moteur CPU:', faster_whisper.__version__, ctranslate2.get_supported_compute_types('cpu'))"
       - name: Unit tests against the Metal wheel
         run: uv run --no-sync pytest -m "not integration" -q
       - name: Build .app + zip (icns, Info.plist micro, ditto)
         run: bash scripts/make_macos_app.sh
+      # Voir la note du job windows : une exclusion PyInstaller qui casse un
+      # import ne se voit qu'ici.
+      - name: Smoke — les deux moteurs dans le .app
+        run: ./dist/EcouteMoi.app/Contents/MacOS/EcouteMoi --check-engines
       - uses: actions/upload-artifact@v7
         with:
           name: EcouteMoi-macos-arm64

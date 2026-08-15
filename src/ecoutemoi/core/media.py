@@ -11,9 +11,10 @@ sont essayés, et le premier qui sait ouvrir le fichier l'emporte :
 2. **ffmpeg**, s'il est installé : tout le reste. M4A/AAC, WMA, AMR, et surtout
    les pistes audio des conteneurs vidéo (MP4, MKV, MOV, WebM, TS) — un
    enregistrement de visioconférence, typiquement.
-3. **PyAV**, s'il est importable : le même ffmpeg, mais en bibliothèque. Il
-   arrive dans les dépendances de développement ; quand il est là, l'utilisateur
-   n'a rien à installer même pour un MKV.
+3. **PyAV**, s'il est importable : le même ffmpeg, mais en bibliothèque. Depuis
+   la 2.0 il est TOUJOURS là — faster-whisper en dépend, et le bundle l'embarque
+   donc pour de bon : plus rien à installer, même pour un MKV. Il reste en
+   troisième position parce qu'un ffmpeg système est souvent plus récent.
 
 Le décodage est un FLUX, pas un tableau : une heure d'audio en 16 kHz mono fait
 230 Mo, une conférence de trois heures 700 Mo. On rend donc des blocs de quelques

@@ -4,30 +4,56 @@
 #   pas de dossier _internal.
 # - Linux   : onedir, empaqueté ensuite en AppImage (scripts/make_appimage.sh).
 # - macOS   : onedir + BUNDLE EcouteMoi.app (scripts/make_macos_app.sh).
-# Embarque l'extension _pywhispercpp + ses libs ggml et la lib native rnnoise,
-# mais PAS le loader Vulkan système (vulkan-1.dll appartient au pilote).
+#
+# DEUX moteurs à embarquer depuis la 2.0 :
+# - whisper.cpp : l'extension _pywhispercpp + ses libs ggml (dont le backend GPU
+#   Vulkan/Metal), mais PAS le loader Vulkan système (vulkan-1.dll appartient au
+#   pilote de l'hôte) ;
+# - faster-whisper : ctranslate2 (+ sa lib native), tokenizers, onnxruntime (VAD
+#   Silero interne) et PyAV, que faster_whisper importe au chargement.
+# Plus la lib native rnnoise.
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
 ROOT = Path(SPECPATH).resolve().parent  # noqa: F821 - SPECPATH is injected
 ASSETS = ROOT / "src" / "ecoutemoi" / "assets"
 
 ONEFILE = sys.platform == "win32"
 
+import sysconfig  # noqa: E402
+
+_site = Path(sysconfig.get_paths()["purelib"])
+
 binaries = []
 binaries += collect_dynamic_libs("pyrnnoise")  # rnnoise.dll / librnnoise.so / .dylib
 binaries += collect_dynamic_libs("pywhispercpp")  # ggml/whisper libs if the wheel ships any
+# onnxruntime range ses libs DANS le paquet (capi/) : collect_dynamic_libs suffit.
+binaries += collect_dynamic_libs("onnxruntime")
+
+# Wheels réparées par auditwheel (Linux) ou delvewheel (Windows) : les libs
+# natives vivent dans un dossier FRÈRE `<paquet>.libs/`, hors de tout package —
+# collect_dynamic_libs ne les voit donc pas. C'est le cas de libctranslate2
+# (75 Mo, le moteur CPU) et de tout ffmpeg sous PyAV. L'analyse binaire les
+# suivrait par la chaîne NEEDED, mais on les embarque explicitement : c'est ce
+# qui rend les garde-fous plus bas capables de distinguer un bundle complet d'un
+# bundle amputé, AVANT d'empaqueter plutôt qu'au premier lancement.
+# (macOS/delocate range les siennes dans `<paquet>/.dylibs/`, dans le paquet.)
+for _sibling in ("ctranslate2.libs", "av.libs", "tokenizers.libs"):
+    _libdir = _site / _sibling
+    if _libdir.is_dir():
+        binaries += [(str(f), ".") for f in _libdir.iterdir() if f.is_file()]
+for _pkg in ("ctranslate2", "av", "tokenizers"):
+    _dylibs = _site / _pkg / ".dylibs"
+    if _dylibs.is_dir():
+        binaries += [(str(f), ".") for f in _dylibs.iterdir() if f.is_file()]
 
 # La wheel moteur compilée localement (non réparée par auditwheel/delocate/
 # delvewheel) place les libs ggml/whisper à la RACINE de site-packages, hors de
 # tout package : collect_dynamic_libs ne les voit pas. L'analyse binaire suit
 # normalement la chaîne NEEDED, mais on les embarque explicitement — ceinture
 # indispensable pour libggml-vulkan/metal (le backend GPU).
-import sysconfig  # noqa: E402
-
-_site = Path(sysconfig.get_paths()["purelib"])
 for _pat in (
     "libggml*.so*", "libwhisper*.so*",
     "libggml*.dylib", "libwhisper*.dylib",
@@ -60,6 +86,10 @@ if os.environ.get("ECOUTEMOI_ALLOW_CPU_BUNDLE") != "1":
 
 datas = [(str(ASSETS), "ecoutemoi/assets")]
 datas += collect_data_files("pyrnnoise", excludes=["**/*.py"])
+# Le VAD Silero de faster-whisper est un .onnx EMBARQUÉ dans le paquet (pas un
+# téléchargement) : sans lui, `vad_filter=True` échoue à l'ouverture de session.
+datas += collect_data_files("faster_whisper")
+datas += collect_data_files("onnxruntime", excludes=["**/*.py", "**/*.pyc"])
 
 # libsndfile, décodeur de fichiers (WAV/FLAC/MP3/OGG/AIFF/CAF). `soundfile` est un
 # MODULE, pas un paquet : collect_data_files ne voit donc pas son dossier de
@@ -79,6 +109,21 @@ if _sf is not None and _sf.origin:
 else:
     raise SystemExit("ecoutemoi.spec : le module soundfile est introuvable (uv sync ?)")
 
+# Garde-fou symétrique de celui du backend GPU, pour l'autre moteur : un bundle
+# sans libctranslate2 ou sans le VAD Silero démarre, affiche « CPU », et
+# n'explique nulle part pourquoi il est trois fois plus lent que prévu.
+_bin_names = " ".join(Path(_src).name.lower() for _src, _dest in binaries)
+if "ctranslate2" not in _bin_names:
+    raise SystemExit(
+        "ecoutemoi.spec : aucune lib ctranslate2 collectée — le moteur CPU "
+        "(faster-whisper) serait absent du bundle. Vérifiez `uv sync`."
+    )
+if not any("silero" in Path(_src).name.lower() for _src, _dest in datas):
+    raise SystemExit(
+        "ecoutemoi.spec : le modèle VAD Silero de faster-whisper n'a pas été "
+        "collecté — `vad_filter` échouerait à l'ouverture de session."
+    )
+
 a = Analysis(
     [str(ROOT / "packaging" / "launcher.py")],
     pathex=[str(ROOT / "src")],
@@ -88,16 +133,35 @@ a = Analysis(
     hiddenimports=[
         "ecoutemoi.gui.main_window",  # lazy-imported from app.main
         "ecoutemoi.cli",
+        "ecoutemoi.core.engine_fw",  # importés à la demande par core/engines
+        "ecoutemoi.core.engines",
+        "ecoutemoi.core.gpuprobe",
         "_pywhispercpp",
         "soundfile",  # importé à la demande par core/media
+        "faster_whisper",
+        "ctranslate2",
+        "tokenizers",
+        # onnxruntime charge son extension par nom : l'analyse statique ne voit
+        # pas `onnxruntime.capi.onnxruntime_pybind11_state`.
+        *collect_submodules("onnxruntime"),
     ],
     excludes=[
         # couches hautes de pyrnnoise contournées volontairement (ctypes direct)
         "matplotlib", "audiolab",
-        # PyAV embarque tout ffmpeg (~35 Mo) et n'est qu'un décodeur de SECOURS :
-        # libsndfile couvre l'essentiel, et un ffmpeg installé fait le reste.
-        "av",
+        # PyAV n'est PLUS optionnel depuis la 2.0 : faster_whisper.audio
+        # l'importe au chargement du module. Il n'est donc plus exclu — et
+        # devient du même coup un décodeur de fichiers de plein droit,
+        # qu'un ffmpeg soit installé ou non (voir core/media.py).
         "PIL", "tkinter", "IPython", "pytest",
+        # torch et transformers ne servent qu'à CONVERTIR un modèle Hugging Face
+        # en CTranslate2 : plusieurs gigaoctets sans emploi ici, nos modèles étant
+        # téléchargés déjà convertis. `ctranslate2.converters` les importe sous
+        # try/except ImportError, donc les exclure est sans danger.
+        # NE PAS exclure `ctranslate2.converters` lui-même : il est importé par
+        # `ctranslate2/__init__.py`, et son absence casse tout le moteur CPU —
+        # sans erreur au build, avec un simple « faster-whisper ABSENT » au
+        # lancement. Vérifié par `--check-engines` après empaquetage.
+        "torch", "transformers",
         "PySide6.QtQml", "PySide6.QtQuick", "PySide6.QtWebEngineCore",
     ],
     noarchive=False,

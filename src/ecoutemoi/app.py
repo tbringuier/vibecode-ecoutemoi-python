@@ -13,7 +13,10 @@ from ecoutemoi import __version__
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ecoutemoi",
-        description="Écoute Moi — sous-titrage temps réel local pour conférences (whisper.cpp).",
+        description=(
+            "Écoute Moi — sous-titrage temps réel local pour conférences "
+            "(faster-whisper au CPU, whisper.cpp au GPU Vulkan/Metal)."
+        ),
     )
     p.add_argument("--version", action="version", version=f"EcouteMoi {__version__}")
     p.add_argument("--cli", action="store_true", help="mode console")
@@ -41,9 +44,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-denoise", action="store_true", help="désactiver la réduction de bruit RNNoise")
     p.add_argument("--no-highpass", action="store_true", help="désactiver le passe-haut 80 Hz")
     p.add_argument("--backend", choices=["auto", "gpu", "cpu"], default=None,
-                   help="moteur : auto (GPU si disponible, repli CPU), gpu (Vulkan/Metal), cpu")  # fmt: skip
+                   help="auto (GPU si disponible, sinon CPU), gpu (whisper.cpp Vulkan/Metal), "
+                        "cpu (faster-whisper)")  # fmt: skip
     p.add_argument("--gpu-device", type=int, default=None, metavar="N",
                    help="index du périphérique GPU en multi-GPU (liste via --diag)")  # fmt: skip
+    p.add_argument("--gpu-probe", metavar="OUT", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--reprobe-gpu", action="store_true",
+                   help="oublier le sondage GPU mémorisé et re-tester la machine, puis quitter")  # fmt: skip
+    p.add_argument("--check-engines", action="store_true",
+                   help="vérifier que les deux moteurs sont utilisables ici, puis quitter")  # fmt: skip
     p.add_argument("--force-cpu", dest="backend", action="store_const", const="cpu",
                    help=argparse.SUPPRESS)  # alias de compatibilité pour --backend cpu  # fmt: skip
     p.add_argument("--list-devices", action="store_true", help="lister les entrées audio puis quitter")
@@ -52,6 +61,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="diagnostic complet (environnement, GPU, modèles) puis quitter")  # fmt: skip
     p.add_argument("--download", metavar="MODEL", default=None,
                    help="télécharger un modèle (ou 'vad', ou 'all') puis quitter")  # fmt: skip
+    p.add_argument("--format", dest="model_format", choices=["ggml", "ct2", "both"], default=None,
+                   help="format téléchargé par --download : ggml (whisper.cpp/GPU), "
+                        "ct2 (faster-whisper/CPU) ou both (défaut : celui du backend)")  # fmt: skip
     p.add_argument("--rtf", metavar="MODELS", default=None,
                    help="mesurer le RTF CPU des modèles donnés (a,b,c) sur --wav puis quitter")  # fmt: skip
     p.add_argument("--bench", action="store_true",
@@ -94,19 +106,30 @@ def _cmd_list_devices() -> int:
 
 
 def _cmd_list_models() -> int:
+    """Le registre, AVEC les deux formats : celui du GPU et celui du CPU.
+
+    Un modèle n'est pas « installé » dans l'absolu en 2.0 — il l'est pour un
+    moteur donné. Masquer cette distinction ferait croire qu'un `small` présent
+    en ggml suffit à démarrer une session CPU, alors qu'il faudra télécharger
+    464 Mo de plus.
+    """
     from ecoutemoi.core import models
 
-    installed = set(models.installed_models())
-    header = f"{'clé':<22} {'quant':>6} {'taille':>9} {'trad. EN':>9} {'RAM est.':>9}  {'installé':>8}  rôle"
-    print(header)
+    ggml = set(models.installed_models(fmt=models.FMT_GGML))
+    ct2 = set(models.installed_models(fmt=models.FMT_CT2))
+    print(f"{'clé':<22} {'quant':>6} {'ggml':>8} {'ct2':>8} {'trad.':>6} {'RAM':>7}  "
+          f"{'installé':<12} rôle")  # fmt: skip
     for key, spec in models.REGISTRY.items():
-        mark = "oui" if key in installed else "non"
-        trad = "oui" if spec.translate else "NON"
+        marks = [f for f, s in (("ggml", ggml), ("ct2", ct2)) if key in s]
+        state = "+".join(marks) if marks else "—"
+        ct2_size = f"{spec.ct2_size_mb} Mo" if spec.ct2_repo else "—"
         print(
-            f"{key:<22} {spec.quant:>6} {spec.size_mb:>6} Mo {trad:>9} "
-            f"{spec.ram_gb:>7.1f} Go  {mark:>8}  {spec.role}"
+            f"{key:<22} {spec.quant:>6} {spec.size_mb:>5} Mo {ct2_size:>8} "
+            f"{'oui' if spec.translate else 'NON':>6} {spec.ram_gb:>5.1f} Go  {state:<12} {spec.role}"
         )
     print(f"\nDossier des modèles : {models.models_dir()}")
+    print("ggml = whisper.cpp (GPU Vulkan/Metal) · ct2 = faster-whisper (CPU).")
+    print("Un dossier ct2 est partagé par toutes les quantizations d'une même famille.")
     return 0
 
 
@@ -139,15 +162,33 @@ def _cmd_import_models(paths: list[str]) -> int:
     return 1 if failed else 0
 
 
-def _cmd_download(arg: str) -> int:
+def _resolve_download_formats(requested: str | None) -> list[str]:
+    """Format(s) à télécharger. Par défaut : celui dont le backend a besoin."""
+    from ecoutemoi.config import load_settings
+    from ecoutemoi.core import models
+
+    if requested == "both":
+        return [models.FMT_GGML, models.FMT_CT2]
+    if requested in (models.FMT_GGML, models.FMT_CT2):
+        return [requested]
+    from ecoutemoi.cli import plan_engine
+
+    _choice, fmt = plan_engine(load_settings())
+    return [fmt]
+
+
+def _cmd_download(arg: str, requested_format: str | None = None) -> int:
     from ecoutemoi.core import models
 
     if arg == "vad":
         models.ensure_vad_model()
         return 0
+    formats = _resolve_download_formats(requested_format)
     if arg == "all":
-        models.download_many(list(models.REGISTRY.values()))
-        models.ensure_vad_model()
+        for fmt in formats:
+            models.download_many(list(models.REGISTRY.values()), fmt=fmt)
+        if models.FMT_GGML in formats:
+            models.ensure_vad_model()
         return 0
     keys = [k.strip() for k in arg.split(",") if k.strip()]
     unknown = [k for k in keys if k not in models.REGISTRY]
@@ -155,8 +196,64 @@ def _cmd_download(arg: str) -> int:
         print(f"Modèle(s) inconnu(s) : {', '.join(unknown)}", file=sys.stderr)
         return 1
     for k in keys:
-        models.ensure_model(k)
-    models.ensure_vad_model()
+        for fmt in formats:
+            models.ensure_model(k, fmt=fmt)
+    if models.FMT_GGML in formats:
+        models.ensure_vad_model()  # VAD ggml : whisper.cpp seul en a besoin
+    return 0
+
+
+def _cmd_check_engines() -> int:
+    """`--check-engines` : les deux moteurs sont-ils réellement utilisables ici ?
+
+    Contrôle d'EMPAQUETAGE avant tout. Un bundle où faster-whisper ne s'importe
+    pas démarre, transcrit et passe tous les autres smoke tests — trois fois plus
+    lentement sur CPU, sans que rien ne le signale. C'est exactement ce qui
+    arrive quand une exclusion PyInstaller casse une chaîne d'imports : aucune
+    erreur au build, aucune erreur au lancement, juste de la lenteur.
+    """
+    from ecoutemoi.core import engine_fw
+    from ecoutemoi.core.engine import gpu_backend_libs
+
+    ok = True
+    try:
+        import _pywhispercpp  # noqa: F401
+        from pywhispercpp.model import Model  # noqa: F401
+
+        libs = gpu_backend_libs()
+        print(f"whisper.cpp (GPU)    : OK · libs backend GPU : {', '.join(libs) if libs else 'AUCUNE'}")
+    except Exception as exc:
+        print(f"whisper.cpp (GPU)    : ABSENT — {type(exc).__name__}: {exc}", file=sys.stderr)
+        ok = False
+    if engine_fw.available():
+        print(f"faster-whisper (CPU) : OK · {engine_fw.versions()} · "
+              f"calcul : {', '.join(engine_fw.supported_compute_types())}")  # fmt: skip
+    else:
+        # `available()` avale l'exception (elle ne doit pas casser une session) :
+        # ici, c'est justement le message qu'on veut voir.
+        try:
+            import ctranslate2  # noqa: F401
+            import faster_whisper  # noqa: F401
+
+            reason = "importable mais déclaré indisponible"  # fmt: skip
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+        print(f"faster-whisper (CPU) : ABSENT — {reason}", file=sys.stderr)
+        ok = False
+    return 0 if ok else 1
+
+
+def _cmd_reprobe_gpu() -> int:
+    """`--reprobe-gpu` : oublie le cache et re-teste la machine."""
+    from ecoutemoi.core import gpuprobe
+
+    gpuprobe.clear_cache()
+    result = gpuprobe.gpu_candidates(force=True)
+    print(f"GPU utilisable : {'oui' if result.gpu else 'non'}")
+    print(f"Détail         : {result.summary}")
+    if result.backend_libs:
+        print(f"Libs backend   : {', '.join(result.backend_libs)}")
+    print(f"Mémorisé dans  : {gpuprobe.cache_path()}")
     return 0
 
 
@@ -181,6 +278,14 @@ def main(argv: list[str] | None = None) -> int:
         from ecoutemoi.core.engine_proc import worker_main
 
         return worker_main()
+    if args.gpu_probe:
+        from ecoutemoi.core.gpuprobe import worker_main as gpu_probe_main
+
+        return gpu_probe_main(args.gpu_probe)
+    if args.check_engines:
+        return _cmd_check_engines()
+    if args.reprobe_gpu:
+        return _cmd_reprobe_gpu()
     if args.import_model:
         return _cmd_import_models(args.import_model)
     if args.diag:
@@ -202,7 +307,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_formats:
         return _cmd_list_formats()
     if args.download:
-        return _cmd_download(args.download)
+        return _cmd_download(args.download, args.model_format)
     if args.rtf:
         from ecoutemoi.cli import run_rtf_bench
 

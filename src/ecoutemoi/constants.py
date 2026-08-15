@@ -17,6 +17,24 @@ OVERLAY_WINDOW_TITLE = "EcouteMoi - Sortie OBS"
 GPU_BACKEND_NAME = "Metal" if sys.platform == "darwin" else "Vulkan"
 BACKENDS = ("auto", "gpu", "cpu")
 
+# --- Moteurs de reconnaissance --------------------------------------------------
+# Écoute Moi 2.0 en embarque deux, chacun là où il gagne (voir core/engines.py) :
+# whisper.cpp est le seul à parler Vulkan/Metal, faster-whisper est ~3x plus
+# rapide sur CPU. Le backend choisi par l'opérateur détermine lequel tourne.
+ENGINE_WHISPERCPP = "whispercpp"
+ENGINE_FASTER_WHISPER = "faster-whisper"
+CPU_ENGINES = (ENGINE_FASTER_WHISPER, ENGINE_WHISPERCPP)
+ENGINE_LABELS: dict[str, str] = {
+    ENGINE_FASTER_WHISPER: "faster-whisper (CTranslate2) — recommandé",
+    ENGINE_WHISPERCPP: "whisper.cpp — repli",
+}
+# Formats de modèle : un par moteur, incompatibles entre eux.
+MODEL_FORMATS = ("ggml", "ct2")
+MODEL_FORMAT_LABELS: dict[str, str] = {
+    "ggml": f"ggml — whisper.cpp ({GPU_BACKEND_NAME}/CPU)",
+    "ct2": "CTranslate2 — faster-whisper (CPU)",
+}
+
 # --- Audio capture / DSP ----------------------------------------------------
 CAPTURE_BLOCK_MS = 10  # native RNNoise frame duration, ultra-short callback
 PREFERRED_CAPTURE_SR = 48_000

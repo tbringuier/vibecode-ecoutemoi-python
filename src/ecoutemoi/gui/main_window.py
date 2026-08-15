@@ -110,6 +110,8 @@ def engine_key(s: Settings, channel: ChannelSpec) -> tuple:
         channel.model,
         channel.mode,
         s.backend,
+        s.cpu_engine,
+        s.cpu_compute_type,
         int(s.gpu_device),
         s.n_threads,
         bool(s.flash_attn),
@@ -228,15 +230,21 @@ class EnginePrewarmer(QObject):
             return False
 
     def _run(self, s: Settings, missing: dict[tuple, ChannelSpec]) -> None:
-        from ecoutemoi.cli import make_engine
+        from ecoutemoi.cli import make_engine, plan_engine
 
+        # Le format qui compte est celui du moteur retenu pour ce backend : un
+        # `small` présent en ggml ne dispense pas des 464 Mo CTranslate2 quand
+        # c'est faster-whisper qui va tourner. Sans cette vérification, ouvrir
+        # l'application déclencherait le téléchargement que le préchauffage
+        # s'interdit précisément de faire.
+        _choice, fmt = plan_engine(s)
         with self._busy:
             for key, channel in missing.items():
                 if self._cancel.is_set():
                     return
                 spec = models.REGISTRY.get(channel.model)
-                if spec is None or not models.is_installed(spec):
-                    log.info("Préchauffage sauté : %s n'est pas installé.", channel.model)
+                if spec is None or not models.is_installed(spec, fmt=fmt):
+                    log.info("Préchauffage sauté : %s n'est pas installé en %s.", channel.model, fmt)
                     continue
                 if not self._status(f"Préchauffage de {channel.model} ({channel.label})…"):
                     return
@@ -348,7 +356,8 @@ class PipelineController(QObject):
             self.engine_diag = primary.diagnostics()
             if s.backend != "cpu" and not primary.gpu_active():
                 prefix = "Backend GPU demandé mais indisponible" if s.backend == "gpu" else "GPU indisponible"
-                self.sig_notice.emit(f"{prefix} — repli CPU : {primary.gpu_diagnostic()}")
+                reason = getattr(primary, "fallback_reason", None) or primary.gpu_diagnostic()
+                self.sig_notice.emit(f"{prefix} — décodage CPU ({primary.backend_info()}) : {reason}")
 
             # Préchauffage AVANT d'ouvrir le micro : le surcoût unique du premier
             # décodage (shaders Vulkan, graphe, caches) est payé ici, pas pendant
@@ -708,12 +717,17 @@ class MainWindow(QMainWindow):
         for rb in (self.mode_fr, self.mode_tr, self.mode_auto):
             rb.toggled.connect(self._validate_start)
         self.backend_combo = QComboBox()
-        self.backend_combo.addItem("Auto — GPU si disponible, repli CPU", "auto")
-        self.backend_combo.addItem(f"GPU ({GPU_BACKEND_NAME})", "gpu")
-        self.backend_combo.addItem("CPU uniquement", "cpu")
+        self.backend_combo.addItem("Auto — GPU si disponible, sinon CPU", "auto")
+        self.backend_combo.addItem(f"GPU ({GPU_BACKEND_NAME}) — whisper.cpp", "gpu")
+        self.backend_combo.addItem("CPU — faster-whisper", "cpu")
         self.backend_combo.setToolTip(
-            f"Moteur d'inférence : {GPU_BACKEND_NAME} (GPU) ou CPU. "
-            "En Auto, le GPU est utilisé s'il est disponible, sinon repli CPU."
+            "Deux moteurs, chacun là où il gagne :\n"
+            f"• GPU ({GPU_BACKEND_NAME}) : whisper.cpp — le seul à savoir parler "
+            "Vulkan et Metal.\n"
+            "• CPU : faster-whisper — environ trois fois plus rapide que "
+            "whisper.cpp sur CPU, mais aveugle au GPU.\n\n"
+            "Chaque moteur a son propre format de modèle : changer de backend "
+            "peut demander un téléchargement (voir « Gérer les modèles »)."
         )
         if self.settings.backend in BACKENDS:
             self.backend_combo.setCurrentIndex(BACKENDS.index(self.settings.backend))
@@ -1464,11 +1478,16 @@ class MainWindow(QMainWindow):
             spec = models.REGISTRY[key]
             badge = "trad. EN : oui" if spec.translate else "trad. EN : NON"
             quant_short = models.QUANT_NOTES.get(spec.quant, ("", ""))[0]
+            # Deux formats : dire lequel est là évite de découvrir au démarrage
+            # qu'un changement de backend implique un téléchargement.
+            present = models.installed_formats(spec) or ["aucun"]
             self.model.addItem(key)
             self.model.setItemData(
                 self.model.count() - 1,
                 f"{spec.role}\n{spec.size_mb} Mo · quantization {spec.quant} "
-                f"({quant_short}) · RAM ~{spec.ram_gb:.1f} Go · {badge}",
+                f"({quant_short}) · RAM ~{spec.ram_gb:.1f} Go · {badge}\n"
+                f"Installé : {' + '.join(present)} "
+                f"(ggml = GPU whisper.cpp, ct2 = CPU faster-whisper)",
                 Qt.ItemDataRole.ToolTipRole,
             )
         if current in (installed or list(models.REGISTRY)):
@@ -1562,8 +1581,9 @@ class MainWindow(QMainWindow):
         if not d:
             return ""
         rows = []
-        for key in ("modele", "backend", "variante_chargement", "chargement_s", "flash_attn",
-                    "vad", "threads", "gpu_devices", "diagnostic_gpu"):  # fmt: skip
+        for key in ("moteur", "modele", "backend", "variante_chargement", "chargement_s",
+                    "type_calcul", "flash_attn", "vad", "threads", "gpu_devices",
+                    "diagnostic_gpu"):  # fmt: skip
             v = d.get(key)
             if v in (None, [], ""):
                 continue
@@ -1779,11 +1799,13 @@ class MainWindow(QMainWindow):
             "À propos",
             f"<b>{APP_DISPLAY_NAME}</b> v{__version__}<br><br>"
             "Sous-titrage temps réel et transcription de fichiers, 100 % en local.<br>"
-            "Moteur whisper.cpp — Vulkan · Metal · CPU.<br><br>"
+            "Deux moteurs : <b>faster-whisper</b> (CTranslate2) sur CPU, "
+            "<b>whisper.cpp</b> sur GPU Vulkan · Metal.<br><br>"
             "Licence <b>GNU GPL v3 ou ultérieure</b> · logiciel gratuit, "
             "fourni sans aucune garantie.<br>"
             "Interface Qt via PySide6 (LGPL) · lecture audio via libsndfile (LGPL).<br>"
-            "Modèles Whisper (ggml) © OpenAI / ggml-org.",
+            "Modèles Whisper © OpenAI · conversions ggml-org (ggml) et "
+            "Systran / mobiuslabs (CTranslate2).",
         )
 
     # ------------------------------------------------------------------ close
@@ -1997,11 +2019,18 @@ class DiagDialog(QDialog):
         import sys
 
         from ecoutemoi.config import config_path
-        from ecoutemoi.core import media
+        from ecoutemoi.core import engine_fw, gpuprobe, media
         from ecoutemoi.core.engine import gpu_backend_libs
 
         frozen = "binaire PyInstaller" if getattr(sys, "frozen", False) else "environnement Python"
         libs = gpu_backend_libs()
+        fw = (
+            f"faster-whisper (CPU) — {engine_fw.versions()} · "
+            f"calcul : {', '.join(engine_fw.supported_compute_types())}"
+            if engine_fw.available()
+            else "faster-whisper (CPU) : ABSENT de cet environnement"
+        )
+        probe = gpuprobe.load_cache()
         lines = [
             f"EcouteMoi {__version__} — diagnostic",
             f"OS         : {platform.platform()} ({platform.machine()})",
@@ -2009,7 +2038,19 @@ class DiagDialog(QDialog):
             f"Config     : {config_path()}",
             f"Log        : {log_dir() / 'ecoutemoi.log'}",
             f"Modèles    : {models.models_dir()}",
-            "Libs backend GPU : " + (", ".join(libs) if libs else "AUCUNE (moteur CPU pur — wheel PyPI ?)"),
+            "",
+            "Moteurs :",
+            "  whisper.cpp (GPU/CPU) — libs backend GPU : "
+            + (", ".join(libs) if libs else "AUCUNE (moteur CPU pur — wheel PyPI ?)"),
+            f"  {fw}",
+            f"  Sondage GPU : {probe.summary if probe else 'pas encore effectué'}",
+            "",
+            "Modèles installés :",
+            *(
+                f"  {key:<22} {'+'.join(models.installed_formats(spec))}"
+                for key, spec in models.REGISTRY.items()
+                if models.installed_formats(spec)
+            ),
             "",
             "Décodeurs de fichiers :",
             *(f"  {row}" for row in media.decoder_report()),

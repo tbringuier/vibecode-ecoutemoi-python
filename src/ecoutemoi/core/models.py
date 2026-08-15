@@ -1,9 +1,22 @@
-"""Model registry, downloads and manual import.
+"""Model registry, downloads and manual import — DEUX formats.
 
-Robustesse : chaque fichier est validé (magie ggml + taille ±5 %) après
-téléchargement ET avant réutilisation — un fichier tronqué ou corrompu est
-re-téléchargé automatiquement. Les téléchargements réessaient avec backoff et
-l'espace disque est vérifié en amont (message clair plutôt qu'un ENOSPC à 95 %).
+Écoute Moi 2.0 a deux moteurs, donc deux formats de poids, incompatibles :
+
+- **ggml** (`ggml-small-q5_1.bin`) pour whisper.cpp — c'est le format du GPU
+  Vulkan/Metal. Un fichier par couple (famille, quantization).
+- **CTranslate2** (dossier `ct2/small/`) pour faster-whisper — c'est le format
+  du CPU. UN SEUL téléchargement par famille : la « quantization » y est un
+  paramètre de chargement (`compute_type`), pas un fichier séparé. `small-q5_1`
+  et `small-q8_0` partagent donc le même dossier `ct2/small/`.
+
+Le registre reste indexé par les MÊMES clés qu'en 1.0 (`small-q5_1`…) : elles
+vivent dans des settings.json et des bench_results.json déjà écrits.
+
+Robustesse : chaque fichier est validé (magie ggml ou en-tête CTranslate2, plus
+la taille à ±5 %) après téléchargement ET avant réutilisation — un fichier
+tronqué ou corrompu est re-téléchargé automatiquement. Les téléchargements
+réessaient avec backoff et l'espace disque est vérifié en amont (message clair
+plutôt qu'un ENOSPC à 95 %).
 """
 
 from __future__ import annotations
@@ -17,7 +30,7 @@ from pathlib import Path
 
 import platformdirs
 
-from ecoutemoi.constants import APP_NAME
+from ecoutemoi.constants import APP_NAME, MODEL_FORMATS
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +42,50 @@ DOWNLOAD_ATTEMPTS = 3  # tentatives réseau par modèle (backoff 2 s puis 5 s)
 DOWNLOAD_BACKOFF_S = (2.0, 5.0)
 GGML_MAGIC = b"lmgg"  # 0x67676d6c little-endian — tous les .bin whisper/silero
 DISK_MARGIN_MB = 200  # marge au-delà de la taille du modèle
+
+FMT_GGML = "ggml"  # whisper.cpp — GPU Vulkan/Metal (et CPU de secours)
+FMT_CT2 = "ct2"  # faster-whisper — CPU
+
+# Dépôts CTranslate2 officiels de faster-whisper (mêmes identifiants que sa
+# table interne `faster_whisper.utils._MODELS` : pas de conversion maison, donc
+# pas de divergence possible avec ce que le moteur sait charger).
+CT2_REPOS: dict[str, str] = {
+    "tiny": "Systran/faster-whisper-tiny",
+    "base": "Systran/faster-whisper-base",
+    "small": "Systran/faster-whisper-small",
+    "medium": "Systran/faster-whisper-medium",
+    "large-v2": "Systran/faster-whisper-large-v2",
+    "large-v3": "Systran/faster-whisper-large-v3",
+    "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+}
+
+# Taille du dossier CTranslate2 par famille (MiB, poids f16 du dépôt amont).
+# Ce sont les octets RÉELLEMENT téléchargés — pas la mémoire à l'exécution :
+# CTranslate2 quantifie au chargement, donc `int8` occupe environ la moitié.
+CT2_SIZE_MB: dict[str, int] = {
+    "tiny": 75,
+    "base": 141,
+    "small": 464,
+    "medium": 1460,
+    "large-v2": 2947,
+    "large-v3": 2948,
+    "large-v3-turbo": 1547,
+}
+
+# Quantization ggml -> type de calcul CTranslate2. CTranslate2 ne descend pas
+# sous 8 bits : q5_0 et q5_1 arrivent donc tous deux sur `int8`. La hiérarchie
+# « plus compact -> plus fidèle » est préservée, ce qui compte pour l'opérateur
+# qui compare deux lignes du benchmark.
+QUANT_TO_COMPUTE: dict[str, str] = {
+    "q5_0": "int8",
+    "q5_1": "int8",
+    "q8_0": "int8_float32",
+    "f16": "float32",
+}
+
+# Fichiers qu'un dossier CTranslate2 doit contenir pour être chargeable.
+CT2_REQUIRED = ("model.bin", "config.json", "tokenizer.json")
+CT2_VOCAB = ("vocabulary.json", "vocabulary.txt")  # l'un OU l'autre selon le dépôt
 
 
 @dataclass(frozen=True)
@@ -42,6 +99,16 @@ class ModelSpec:
     role: str  # short FR description for the UI
     family: str = ""  # tiny | base | small | medium | large-v3-turbo | large-v2 | large-v3
     quant: str = "f16"  # f16 | q5_0 | q5_1 | q8_0 — voir QUANT_NOTES
+    # --- format CTranslate2 (faster-whisper, CPU) ---
+    ct2_repo: str = ""  # "" => pas de conversion CTranslate2 publiée
+    ct2_size_mb: int = 0  # taille du dossier téléchargé (MiB)
+    compute_type: str = "int8"  # type de calcul demandé à CTranslate2
+
+    def size_mb_for(self, fmt: str) -> int:
+        return self.ct2_size_mb if fmt == FMT_CT2 else self.size_mb
+
+    def supports(self, fmt: str) -> bool:
+        return bool(self.ct2_repo) if fmt == FMT_CT2 else True
 
 
 # Quantizations disponibles pour un modèle donné, de la plus compacte à la plus
@@ -82,11 +149,16 @@ def _spec(family: str, quant: str, size_mb: int, translate: bool, ram_gb: float,
 
     La clé et le nom de fichier sont DÉRIVÉS (pas recopiés) : c'est ce qui garantit
     que `key` reste stable pour les settings/benchs déjà enregistrés et qu'aucune
-    coquille ne se glisse dans un tableau de 17 lignes.
+    coquille ne se glisse dans un tableau de 17 lignes. Le versant CTranslate2
+    (dépôt, taille, type de calcul) se déduit de la même façon, depuis la famille
+    et la quantization.
     """
     stem = family if quant == "f16" else f"{family}-{quant}"
     return ModelSpec(stem, f"ggml-{stem}.bin", WHISPER_REPO, size_mb, translate,
-                     ram_gb, role, family, quant)  # fmt: skip
+                     ram_gb, role, family, quant,
+                     ct2_repo=CT2_REPOS.get(family, ""),
+                     ct2_size_mb=CT2_SIZE_MB.get(family, 0),
+                     compute_type=QUANT_TO_COMPUTE.get(quant, "int8"))  # fmt: skip
 
 
 # Toutes les variantes MULTILINGUES du dépôt ggml plausibles en temps réel, pour
@@ -143,10 +215,15 @@ def recommended_default_model() -> str:
     """Modèle par défaut profilé sur la machine (premier lancement, avant tout bench).
 
     Heuristique CPU volontairement prudente — le benchmark guidé affine ensuite :
-    - >= 8 cœurs utiles et >= 8 Go de RAM : small-q5_1 ;
+    - >= 6 cœurs utiles et >= 8 Go de RAM : small-q5_1 ;
     - >= 4 cœurs utiles et >= 4 Go : base-q5_1 ;
     - sinon : tiny-q5_1.
     (« cœurs utiles » = P-cores physiques sur CPU hybride, sinon cœurs physiques.)
+
+    Le seuil de `small` est descendu de 8 à 6 cœurs en 2.0 : faster-whisper
+    décode `small` en ~870 ms sur une fenêtre de 9 s avec 6 P-cores (RTF ≈ 10),
+    là où whisper.cpp mettait 2,9 s (RTF ≈ 3). Le pire cas — machine sans GPU —
+    est donc largement au-dessus du plancher temps réel.
     """
     import psutil
 
@@ -154,7 +231,7 @@ def recommended_default_model() -> str:
 
     cores = cpuinfo.best_n_threads()
     ram_gb = psutil.virtual_memory().total / 1e9
-    if cores >= 8 and ram_gb >= 8:
+    if cores >= 6 and ram_gb >= 8:
         choice = "small-q5_1"
     elif cores >= 4 and ram_gb >= 4:
         choice = "base-q5_1"
@@ -170,16 +247,48 @@ def models_dir(base: Path | None = None) -> Path:
 
 
 def model_path(spec: ModelSpec, base: Path | None = None) -> Path:
+    """Chemin du `.bin` ggml (whisper.cpp)."""
     return models_dir(base) / spec.filename
 
 
-def is_installed(spec: ModelSpec, base: Path | None = None) -> bool:
+def ct2_dir(spec: ModelSpec, base: Path | None = None) -> Path:
+    """Dossier CTranslate2 (faster-whisper) — UN par FAMILLE, pas par quantization.
+
+    La quantization CTranslate2 se choisit au chargement (`compute_type`) : tous
+    les `small-*` du registre partagent donc le même dossier `ct2/small/`, et
+    l'opérateur ne télécharge pas trois fois le même modèle.
+    """
+    return models_dir(base) / "ct2" / (spec.family or spec.key)
+
+
+def model_location(spec: ModelSpec, fmt: str, base: Path | None = None) -> Path:
+    """Où vit ce modèle dans ce format : un fichier (ggml) ou un dossier (ct2)."""
+    return ct2_dir(spec, base) if fmt == FMT_CT2 else model_path(spec, base)
+
+
+def is_installed(spec: ModelSpec, base: Path | None = None, fmt: str | None = None) -> bool:
+    """`fmt=None` => installé dans AU MOINS un des deux formats.
+
+    C'est le sens utile pour lister des modèles dans l'interface : celui qui
+    manque au backend courant sera récupéré au moment d'ouvrir la session.
+    """
+    if fmt is None:
+        return any(is_installed(spec, base, f) for f in MODEL_FORMATS)
+    if fmt == FMT_CT2:
+        if not spec.ct2_repo:
+            return False
+        d = ct2_dir(spec, base)
+        return d.is_dir() and (d / "model.bin").is_file() and (d / "model.bin").stat().st_size > 0
     p = model_path(spec, base)
     return p.is_file() and p.stat().st_size > 0
 
 
-def installed_models(base: Path | None = None) -> list[str]:
-    return [key for key, spec in REGISTRY.items() if is_installed(spec, base)]
+def installed_formats(spec: ModelSpec, base: Path | None = None) -> list[str]:
+    return [f for f in MODEL_FORMATS if is_installed(spec, base, f)]
+
+
+def installed_models(base: Path | None = None, fmt: str | None = None) -> list[str]:
+    return [key for key, spec in REGISTRY.items() if is_installed(spec, base, fmt)]
 
 
 def check_size(path: Path, spec: ModelSpec) -> bool:
@@ -213,16 +322,45 @@ def validate_model_file(path: Path, spec: ModelSpec) -> str | None:
     return None
 
 
-def _check_free_space(dest_dir: Path, spec: ModelSpec) -> None:
+def validate_ct2_dir(path: Path, spec: ModelSpec) -> str | None:
+    """None si le dossier CTranslate2 est chargeable, sinon la raison.
+
+    On vérifie la PRÉSENCE des fichiers indispensables et la taille des poids :
+    un `snapshot_download` interrompu laisse volontiers un dossier à moitié
+    peuplé, et CTranslate2 ne s'en plaindrait qu'à l'ouverture de la session.
+    """
+    if not path.is_dir():
+        return "dossier absent"
+    missing = [name for name in CT2_REQUIRED if not (path / name).is_file()]
+    if missing:
+        return f"fichier(s) manquant(s) : {', '.join(missing)}"
+    if not any((path / name).is_file() for name in CT2_VOCAB):
+        return f"vocabulaire absent ({' ou '.join(CT2_VOCAB)})"
+    size = (path / "model.bin").stat().st_size
+    if size == 0:
+        return "model.bin vide"
+    expected = spec.ct2_size_mb * 1024 * 1024
+    if expected and abs(size - expected) > expected * (SIZE_TOLERANCE + 0.02):
+        return f"model.bin hors tolérance ({size} octets pour ~{spec.ct2_size_mb} Mo)"
+    return None
+
+
+def validate_model(spec: ModelSpec, fmt: str, base: Path | None = None) -> str | None:
+    """Validation d'un modèle dans le format demandé (None = sain)."""
+    path = model_location(spec, fmt, base)
+    return validate_ct2_dir(path, spec) if fmt == FMT_CT2 else validate_model_file(path, spec)
+
+
+def _check_free_space(dest_dir: Path, spec: ModelSpec, fmt: str = FMT_GGML) -> None:
     """Échec précoce et lisible plutôt qu'un ENOSPC au milieu du téléchargement."""
     try:
         free_mb = shutil.disk_usage(dest_dir).free / (1024 * 1024)
     except OSError:
         return  # système de fichiers exotique : on laisse le téléchargement trancher
-    needed_mb = spec.size_mb + DISK_MARGIN_MB
+    needed_mb = spec.size_mb_for(fmt) + DISK_MARGIN_MB
     if free_mb < needed_mb:
         raise OSError(
-            f"Espace disque insuffisant pour {spec.key} : {free_mb:.0f} Mo libres, "
+            f"Espace disque insuffisant pour {spec.key} ({fmt}) : {free_mb:.0f} Mo libres, "
             f"~{needed_mb} Mo nécessaires ({dest_dir})"
         )
 
@@ -324,36 +462,112 @@ def download_model(spec: ModelSpec, base: Path | None = None, tqdm_class=None) -
     ) from last_exc
 
 
-def download_many(specs: list[ModelSpec], base: Path | None = None) -> list[Path]:
-    """Télécharge en parallèle ; les échecs n'annulent pas les autres modèles."""
+def download_ct2_model(spec: ModelSpec, base: Path | None = None, tqdm_class=None) -> Path:
+    """Télécharge le dossier CTranslate2 d'une famille (faster-whisper).
+
+    `snapshot_download` plutôt qu'un fichier à la fois : un modèle CTranslate2
+    est un ENSEMBLE (poids + config + tokenizer + vocabulaire) dont aucun
+    élément n'est facultatif. On écarte explicitement le README et les
+    métadonnées git, qui ne servent à rien et gonflent le dossier.
+    """
+    if not spec.ct2_repo:
+        raise ValueError(f"{spec.key} n'a pas de conversion CTranslate2 publiée")
+    from huggingface_hub import snapshot_download
+
+    dest = ct2_dir(spec, base)
+    dest.mkdir(parents=True, exist_ok=True)
+    _check_free_space(dest, spec, FMT_CT2)
+    log.info("Téléchargement CTranslate2 %s (%s, ~%d Mo)…", spec.family, spec.ct2_repo, spec.ct2_size_mb)
+    extra = {"tqdm_class": tqdm_class} if tqdm_class is not None else {}
+
+    last_exc: Exception | None = None
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            snapshot_download(
+                spec.ct2_repo,
+                local_dir=str(dest),
+                allow_patterns=["*.json", "*.txt", "model.bin"],
+                ignore_patterns=["README.md", ".gitattributes"],
+                **extra,
+            )
+            reason = validate_ct2_dir(dest, spec)
+            if reason is None:
+                log.info("Modèle CTranslate2 %s prêt : %s", spec.family, dest)
+                return dest
+            log.warning("Téléchargement CTranslate2 %s invalide (%s).", spec.family, reason)
+            last_exc = OSError(f"dossier CTranslate2 invalide : {reason}")
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            log.warning("CTranslate2 %s : tentative %d/%d échouée : %s",
+                        spec.family, attempt, DOWNLOAD_ATTEMPTS, exc)  # fmt: skip
+        if attempt < DOWNLOAD_ATTEMPTS:
+            time.sleep(DOWNLOAD_BACKOFF_S[min(attempt - 1, len(DOWNLOAD_BACKOFF_S) - 1)])
+    raise OSError(
+        f"Téléchargement CTranslate2 de {spec.family} impossible après {DOWNLOAD_ATTEMPTS} "
+        f"tentatives : {last_exc} — vérifiez la connexion (proxy ?) et l'espace disque, "
+        f"ou copiez le dépôt {spec.ct2_repo} dans {dest}"
+    ) from last_exc
+
+
+def download(spec: ModelSpec, fmt: str, base: Path | None = None, tqdm_class=None) -> Path:
+    """Téléchargement d'un modèle dans le format demandé."""
+    if fmt == FMT_CT2:
+        return download_ct2_model(spec, base, tqdm_class)
+    return download_model(spec, base, tqdm_class)
+
+
+def download_many(specs: list[ModelSpec], base: Path | None = None,
+                  fmt: str = FMT_GGML) -> list[Path]:  # fmt: skip
+    """Télécharge en parallèle ; les échecs n'annulent pas les autres modèles.
+
+    En CTranslate2 les doublons de FAMILLE sont écartés : `small-q5_1` et
+    `small-q8_0` désignent le même dossier, le télécharger deux fois en
+    parallèle ne ferait que se marcher dessus.
+    """
     results: dict[str, Path] = {}
     failures: dict[str, Exception] = {}
+    todo: list[ModelSpec] = []
+    seen: set[str] = set()
+    for s in specs:
+        if not s.supports(fmt):
+            continue
+        marker = (s.family or s.key) if fmt == FMT_CT2 else s.key
+        if marker in seen:
+            continue
+        seen.add(marker)
+        todo.append(s)
 
     def one(s: ModelSpec) -> None:
         try:
-            results[s.key] = download_model(s, base)
+            results[s.key] = download(s, fmt, base)
         except Exception as exc:  # collecté, relancé en agrégat
             failures[s.key] = exc
 
     with ThreadPoolExecutor(max_workers=DOWNLOAD_POOL) as pool:
-        list(pool.map(one, specs))
+        list(pool.map(one, todo))
     if failures:
         detail = " ; ".join(f"{k}: {e}" for k, e in failures.items())
         raise OSError(f"{len(failures)} téléchargement(s) en échec — {detail}")
-    return [results[s.key] for s in specs]
+    return [results[s.key] for s in todo if s.key in results]
 
 
-def ensure_model(key: str, base: Path | None = None) -> Path:
-    """Chemin du modèle, en le (re)téléchargeant si absent OU corrompu."""
+def ensure_model(key: str, base: Path | None = None, fmt: str = FMT_GGML) -> Path:
+    """Chemin du modèle dans ce format, en le (re)téléchargeant si absent OU corrompu."""
     spec = REGISTRY[key]
-    p = model_path(spec, base)
-    reason = validate_model_file(p, spec) if p.is_file() else "fichier absent"
+    if fmt == FMT_CT2 and not spec.ct2_repo:
+        raise ValueError(f"{key} n'a pas de conversion CTranslate2 publiée")
+    path = model_location(spec, fmt, base)
+    reason = validate_model(spec, fmt, base)
     if reason is None:
-        return p
-    if p.is_file():
+        return path
+    if fmt == FMT_GGML and path.is_file():
         log.warning("Modèle %s invalide sur disque (%s) — re-téléchargement.", key, reason)
-        p.unlink(missing_ok=True)
-    return download_model(spec, base)
+        path.unlink(missing_ok=True)
+    elif fmt == FMT_CT2 and path.exists():
+        log.warning("Modèle CTranslate2 %s incomplet (%s) — complété.", spec.family, reason)
+    return download(spec, fmt, base)
 
 
 def _any_silero_on_disk(base: Path | None) -> Path | None:

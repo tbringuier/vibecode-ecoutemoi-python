@@ -22,15 +22,22 @@ from pathlib import Path
 import numpy as np
 
 from ecoutemoi.config import load_settings
-from ecoutemoi.constants import PRESETS, TARGET_SR
-from ecoutemoi.core import models
+from ecoutemoi.constants import ENGINE_FASTER_WHISPER, PRESETS, TARGET_SR
+from ecoutemoi.core import engines, models
 from ecoutemoi.core.dsp import DspChain
-from ecoutemoi.core.engine import EngineParams, Segment, WhisperEngine
+from ecoutemoi.core.engine_base import EngineParams, Segment
 from ecoutemoi.core.gate import SpeechGate
 from ecoutemoi.core.streamer import Streamer, StreamStats
 from ecoutemoi.core.transcript import SessionSegment, TranscriptStore, new_session_dir
 
 log = logging.getLogger(__name__)
+
+# Largeur de faisceau du décodeur. En DIRECT, glouton (1) : chaque hypothèse
+# supplémentaire coûte un passage de décodeur complet, et la latence se paie
+# devant la salle. Sur FICHIER, plus rien ne presse et la qualité prime — voir
+# FILE_BEAM_SIZE. (Sans effet sur whisper.cpp, dont le décodage reste glouton.)
+STREAM_BEAM_SIZE = 1
+FILE_BEAM_SIZE = 5
 
 _WHITE = "\x1b[97m"
 _GRAY = "\x1b[90m"
@@ -177,6 +184,50 @@ def resolve_mode(mode: str, spec: models.ModelSpec) -> tuple[str, bool]:
     return language, translate
 
 
+def plan_engine(settings, backend: str | None = None, engine: str | None = None) -> tuple[str, str]:
+    """(moteur retenu, format de modèle INDISPENSABLE) pour ce backend.
+
+    C'est ici que se joue la répartition de la 2.0 : whisper.cpp au GPU,
+    faster-whisper au CPU. En backend « auto », il faut trancher AVANT de
+    télécharger — sinon on ferait payer les deux formats (665 Mo pour `small` au
+    lieu de 181 ou 464) à tout le monde. Le sondage GPU (`core/gpuprobe`) tient
+    ce rôle : il n'ouvre aucun modèle et son résultat est mis en cache.
+
+    « auto » RESTE possible en sortie : des périphériques sont énumérés, mais
+    seul le chargement réel dira s'ils s'initialisent — `core/engines.py` garde
+    donc son repli. Le format indispensable est celui du moteur retenu ; l'autre
+    n'est branché que s'il est DÉJÀ sur disque.
+    """
+    backend = backend or settings.backend
+    cpu_engine = getattr(settings, "cpu_engine", ENGINE_FASTER_WHISPER)
+    choice = engine or engines.engine_for_backend(backend, cpu_engine)
+    if choice == "auto":
+        from ecoutemoi.core import gpuprobe
+
+        probe = gpuprobe.gpu_candidates()
+        if not probe.gpu:
+            log.info("Sondage GPU : aucun périphérique (%s) — moteur CPU.", probe.summary)
+            choice = cpu_engine
+    fmt = models.FMT_CT2 if choice == ENGINE_FASTER_WHISPER else models.FMT_GGML
+    return choice, fmt
+
+
+def resolve_model_paths(spec, choice: str) -> tuple[Path | None, Path | None]:
+    """(chemin ggml, dossier CTranslate2) — télécharge le format indispensable.
+
+    L'autre format n'est jamais téléchargé ici : il n'est branché que s'il se
+    trouve déjà sur disque, où il sert de repli gratuit (moteur CPU absent de
+    l'environnement, GPU énuméré mais qui refuse de s'initialiser).
+    """
+    if choice == ENGINE_FASTER_WHISPER and spec.ct2_repo:
+        ct2 = models.ensure_model(spec.key, fmt=models.FMT_CT2)
+        ggml = models.model_path(spec) if models.is_installed(spec, fmt=models.FMT_GGML) else None
+        return ggml, ct2
+    ggml = models.ensure_model(spec.key, fmt=models.FMT_GGML)
+    ct2 = models.ct2_dir(spec) if models.is_installed(spec, fmt=models.FMT_CT2) else None
+    return ggml, ct2
+
+
 def make_engine(
     settings,
     model_key: str,
@@ -185,34 +236,45 @@ def make_engine(
     backend: str | None = None,
     gpu_device: int | None = None,
     subprocess: bool | None = None,
+    engine: str | None = None,
+    beam_size: int | None = None,
 ):
     """Shared engine factory (CLI + GUI). Raises ValueError on unsupported combos.
 
     `subprocess=None` suit le réglage `engine_subprocess` ; l'objet retourné
-    expose la même surface que `WhisperEngine` dans les deux cas. Les workers de
-    benchmark passent explicitement False : ils SONT déjà des sous-processus.
+    expose la même surface quel que soit le moteur ET le nombre de processus.
+    Les workers de benchmark passent explicitement False : ils SONT déjà des
+    sous-processus.
     """
     spec = models.REGISTRY[model_key]
     language, translate = resolve_mode(mode, spec)
-    model_path = models.ensure_model(model_key)
-    try:
-        vad_path = models.ensure_vad_model()
-    except Exception as exc:
-        log.warning("VAD Silero indisponible (%s) — repli : gate seul + filtre no_speech", exc)
-        vad_path = None
+    backend = backend or settings.backend
+    choice, _fmt = plan_engine(settings, backend=backend, engine=engine)
+    model_path, ct2_path = resolve_model_paths(spec, choice)
+    vad_path = None
+    if model_path is not None:  # VAD ggml : whisper.cpp seul en a besoin
+        try:
+            vad_path = models.ensure_vad_model()
+        except Exception as exc:
+            log.warning("VAD Silero indisponible (%s) — repli : gate seul + filtre no_speech", exc)
     if gpu_device is None:
         gpu_device = getattr(settings, "gpu_device", 0)
+    wanted_compute = getattr(settings, "cpu_compute_type", "auto")
     params = EngineParams(
         model_path=model_path,
         language=language,
         translate=translate,
         n_threads=settings.n_threads,
-        backend=backend or settings.backend,
+        backend=backend,
         flash_attn=settings.flash_attn,
         vad_model_path=vad_path,
         carry_context=settings.carry_context,
         gpu_device=max(0, int(gpu_device or 0)),
         lexicon=getattr(settings, "lexicon", "") or "",
+        ct2_path=ct2_path,
+        compute_type=spec.compute_type if wanted_compute in ("", "auto") else wanted_compute,
+        beam_size=STREAM_BEAM_SIZE if beam_size is None else max(1, int(beam_size)),
+        engine=choice,
     )
     if subprocess is None:
         subprocess = bool(getattr(settings, "engine_subprocess", False))
@@ -220,17 +282,18 @@ def make_engine(
         from ecoutemoi.core.engine_proc import SubprocessEngine
 
         return SubprocessEngine(params)
-    return WhisperEngine(params)
+    return engines.create_engine(params)
 
 
-def _make_engine(args, settings, model_key: str, mode: str, *, subprocess: bool | None = None):
+def _make_engine(args, settings, model_key: str, mode: str, *, subprocess: bool | None = None,
+                 beam_size: int | None = None):  # fmt: skip
     try:
         if subprocess is None and getattr(args, "engine_in_process", False):
             subprocess = False
         return make_engine(
             settings, model_key, mode,
             backend=args.backend, gpu_device=getattr(args, "gpu_device", None),
-            subprocess=subprocess,
+            subprocess=subprocess, beam_size=beam_size,
         )  # fmt: skip
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
@@ -294,7 +357,8 @@ def run_cli(args) -> int:
     requested = args.backend or settings.backend
     if requested != "cpu" and not engine.gpu_active():
         prefix = "Backend GPU demandé mais indisponible" if requested == "gpu" else "GPU indisponible"
-        ui.notice(f"{prefix} — repli CPU : {engine.gpu_diagnostic()}")
+        reason = getattr(engine, "fallback_reason", None) or engine.gpu_diagnostic()
+        ui.notice(f"{prefix} — décodage CPU ({engine.backend_info()}) : {reason}")
     ui.line(f"Session : {session_dir}")
     ui.line("Ctrl+C pour arrêter.")
 
@@ -501,7 +565,9 @@ def run_transcribe(args) -> int:
 
     ui = ConsoleUI()
     ui.line(f"Modèle : {model_key} · mode {mode} · formats {', '.join(keys)}")
-    engine = _make_engine(args, settings, model_key, mode)
+    # Hors direct, aucune latence à tenir : on paie un faisceau plus large pour
+    # un texte meilleur (sans effet sur whisper.cpp, glouton par construction).
+    engine = _make_engine(args, settings, model_key, mode, beam_size=FILE_BEAM_SIZE)
     ui.line(f"Backend : {engine.backend_info()}")
     lang = "fr" if mode == "fr" else "en"
 
@@ -579,6 +645,7 @@ def diag_report(args, settings) -> tuple[list[str], int]:
 
     from ecoutemoi import __version__
     from ecoutemoi.config import config_path
+    from ecoutemoi.core import engine_fw, gpuprobe
     from ecoutemoi.core.engine import gpu_backend_libs
     from ecoutemoi.logging_setup import log_dir
 
@@ -595,7 +662,17 @@ def diag_report(args, settings) -> tuple[list[str], int]:
     ]
     libs = gpu_backend_libs()
     libs_txt = ", ".join(libs) if libs else "AUCUNE (moteur CPU pur — wheel PyPI ?)"
-    lines.append(f"Libs backend GPU : {libs_txt}")
+    lines.append("")
+    lines.append("Moteurs :")
+    lines.append(f"  whisper.cpp (GPU {'Metal' if sys.platform == 'darwin' else 'Vulkan'}/CPU)")
+    lines.append(f"    libs backend GPU : {libs_txt}")
+    if engine_fw.available():
+        lines.append(f"  faster-whisper (CPU) — {engine_fw.versions()}")
+        lines.append(f"    types de calcul CPU : {', '.join(engine_fw.supported_compute_types())}")
+    else:
+        lines.append("  faster-whisper (CPU) : ABSENT de cet environnement")
+    probe = gpuprobe.gpu_candidates()
+    lines.append(f"  Sondage GPU (cache {gpuprobe.cache_path().name}) : {probe.summary}")
 
     from ecoutemoi.core import media
 
@@ -608,12 +685,15 @@ def diag_report(args, settings) -> tuple[list[str], int]:
     lines.append("Modèles installés :")
     installed_any = False
     for key, spec in models.REGISTRY.items():
-        p = models.model_path(spec)
-        if p.is_file():
+        for fmt in models.MODEL_FORMATS:
+            if not models.is_installed(spec, fmt=fmt):
+                continue
             installed_any = True
-            reason = models.validate_model_file(p, spec)
+            path = models.model_location(spec, fmt)
+            reason = models.validate_model(spec, fmt)
             state = "OK" if reason is None else f"INVALIDE — {reason}"
-            lines.append(f"  {key:<22} {p.stat().st_size / 1e6:8.1f} Mo  {state}")
+            size = (path / "model.bin").stat().st_size if fmt == models.FMT_CT2 else path.stat().st_size
+            lines.append(f"  {key:<22} {fmt:<5} {size / 1e6:8.1f} Mo  {state}")
     if not installed_any:
         lines.append("  (aucun — utilisez --download ou « Gérer les modèles »)")
 
@@ -631,8 +711,9 @@ def diag_report(args, settings) -> tuple[list[str], int]:
         return lines, 0
 
     backend = getattr(args, "backend", None) or settings.backend
+    choice, fmt = plan_engine(settings, backend=backend)
     lines.append("")
-    lines.append(f"Chargement du moteur : {model_key} · backend {backend}…")
+    lines.append(f"Chargement du moteur : {model_key} · backend {backend} · moteur {choice} ({fmt})…")
     # Diagnostic DANS ce processus : on veut l'état du moteur ici, pas celui d'un
     # enfant qu'il faudrait interroger à travers un tube.
     try:
@@ -649,7 +730,7 @@ def diag_report(args, settings) -> tuple[list[str], int]:
         tail = list(engine.sink.lines)[-12:]
         if tail:
             lines.append("")
-            lines.append("Dernières lignes whisper.cpp :")
+            lines.append("Dernières lignes du moteur :")
             lines += [f"  {ln}" for ln in tail]
     finally:
         engine.close()
@@ -711,13 +792,16 @@ def run_bench(args) -> int:
         if not keys:
             print("Aucun modèle installé (voir --download).", file=sys.stderr)
             return 1
-    for k in keys:
-        models.ensure_model(k)
     settings = load_settings()
     backend = args.backend or settings.backend
     gpu_device = args.gpu_device if args.gpu_device is not None else settings.gpu_device
+    # Le benchmark mesure LE moteur qui tournera vraiment : c'est donc le format
+    # du backend choisi qu'il faut avoir sur disque, pas systématiquement ggml.
+    choice, fmt = plan_engine(settings, backend=backend)
+    for k in keys:
+        models.ensure_model(k, fmt=fmt)
 
-    print(f"Benchmark : {', '.join(sorted(keys))}")
+    print(f"Benchmark : {', '.join(sorted(keys))} · moteur {choice} ({fmt})")
     print(f"FR : {wav_fr or '—'} · EN : {wav_en or '—'}")
     results = bench.run_benchmark(keys, wav_fr, wav_en, backend=backend,
                                   gpu_device=gpu_device, progress=print)  # fmt: skip

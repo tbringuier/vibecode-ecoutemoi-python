@@ -1,14 +1,20 @@
-"""Model registry invariants."""
+"""Model registry invariants — ggml (whisper.cpp) ET CTranslate2 (faster-whisper)."""
 
 import pytest
 
 from ecoutemoi.constants import DEFAULT_MODEL
 from ecoutemoi.core.models import (
+    CT2_REPOS,
+    FMT_CT2,
+    FMT_GGML,
     QUANT_NOTES,
     QUANT_ORDER,
+    QUANT_TO_COMPUTE,
     REGISTRY,
     VAD_SPEC,
     check_size,
+    ct2_dir,
+    model_location,
     model_path,
     models_dir,
 )
@@ -121,6 +127,53 @@ def test_model_path_under_models_dir(tmp_path):
     spec = REGISTRY["tiny-q5_1"]
     p = model_path(spec, base=tmp_path)
     assert p == models_dir(tmp_path) / "ggml-tiny-q5_1.bin"
+
+
+# ------------------------------------------------------- versant CTranslate2
+def test_every_family_has_a_ctranslate2_conversion():
+    """Un modèle sans conversion CTranslate2 serait inutilisable en CPU, donc
+    invisible pour la majorité des machines : ça se verrait ici, pas en salle."""
+    for key, spec in REGISTRY.items():
+        assert spec.ct2_repo, f"{key} n'a pas de dépôt CTranslate2"
+        assert spec.ct2_repo == CT2_REPOS[spec.family]
+        assert spec.ct2_size_mb > 0
+
+
+def test_ct2_dir_is_shared_by_the_whole_family(tmp_path):
+    """La quantization CTranslate2 est un paramètre de CHARGEMENT, pas un
+    fichier : les trois `small-*` doivent viser le même dossier, sinon
+    l'opérateur télécharge trois fois 464 Mo pour rien."""
+    smalls = [s for s in REGISTRY.values() if s.family == "small"]
+    assert len(smalls) == 3
+    dirs = {ct2_dir(s, base=tmp_path) for s in smalls}
+    assert dirs == {models_dir(tmp_path) / "ct2" / "small"}
+
+
+def test_model_location_switches_on_format(tmp_path):
+    spec = REGISTRY["small-q5_1"]
+    assert model_location(spec, FMT_GGML, tmp_path) == model_path(spec, tmp_path)
+    assert model_location(spec, FMT_CT2, tmp_path) == ct2_dir(spec, tmp_path)
+
+
+def test_compute_type_ordering_mirrors_quantization():
+    """CTranslate2 ne descend pas sous 8 bits (q5_0 et q5_1 arrivent donc tous
+    deux sur int8), mais la hiérarchie « plus compact -> plus fidèle » du
+    registre doit rester lisible dans le type de calcul."""
+    assert QUANT_TO_COMPUTE["q5_0"] == QUANT_TO_COMPUTE["q5_1"] == "int8"
+    assert QUANT_TO_COMPUTE["q8_0"] == "int8_float32"
+    assert QUANT_TO_COMPUTE["f16"] == "float32"
+    assert "float16" not in QUANT_TO_COMPUTE.values()  # inexistant sur CPU
+    for spec in REGISTRY.values():
+        assert spec.compute_type == QUANT_TO_COMPUTE[spec.quant]
+
+
+def test_ct2_size_is_shared_and_declared_honestly():
+    """Les poids CTranslate2 amont sont en demi-précision : le dossier est plus
+    gros que le .bin quantifié, et l'annoncer évite la mauvaise surprise."""
+    for spec in REGISTRY.values():
+        same_family = [s for s in REGISTRY.values() if s.family == spec.family]
+        assert len({s.ct2_size_mb for s in same_family}) == 1
+    assert REGISTRY["small-q5_1"].ct2_size_mb > REGISTRY["small-q5_1"].size_mb
 
 
 def test_check_size_tolerance(tmp_path):

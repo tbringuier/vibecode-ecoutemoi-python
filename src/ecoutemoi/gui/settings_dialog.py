@@ -34,11 +34,27 @@ from PySide6.QtWidgets import (
 )
 
 from ecoutemoi.config import Settings
-from ecoutemoi.constants import BACKENDS, GPU_BACKEND_NAME, PRESETS
+from ecoutemoi.constants import (
+    BACKENDS,
+    CPU_ENGINES,
+    ENGINE_LABELS,
+    GPU_BACKEND_NAME,
+    PRESETS,
+)
 from ecoutemoi.core import models
 from ecoutemoi.gui.theme import mono_font
 
 log = logging.getLogger(__name__)
+
+# Deux moteurs, une seule phrase pour l'expliquer à l'opérateur.
+BACKEND_TOOLTIP = (
+    "Écoute Moi embarque deux moteurs et prend le meilleur de chacun :\n"
+    f"• GPU ({GPU_BACKEND_NAME}) : whisper.cpp — le seul à savoir parler "
+    "Vulkan et Metal.\n"
+    "• CPU : faster-whisper (CTranslate2) — environ trois fois plus rapide que "
+    "whisper.cpp sur CPU, mais totalement aveugle au GPU.\n\n"
+    "« Auto » teste le GPU au lancement et retombe sur le CPU s'il ne répond pas."
+)
 
 BG_PRESETS = [
     ("Vert (chroma)", "#00FF00"),
@@ -161,10 +177,35 @@ class SettingsDialog(QDialog):
         self.flash = QCheckBox("flash attention (repli automatique si échec)")
         self.flash.setChecked(s.flash_attn)
         self.backend = QComboBox()
-        self.backend.addItem("Auto — GPU si disponible, repli CPU", "auto")
-        self.backend.addItem(f"GPU ({GPU_BACKEND_NAME})", "gpu")
-        self.backend.addItem("CPU uniquement", "cpu")
+        self.backend.addItem("Auto — GPU si disponible, sinon CPU", "auto")
+        self.backend.addItem(f"GPU ({GPU_BACKEND_NAME}) — whisper.cpp", "gpu")
+        self.backend.addItem("CPU — faster-whisper", "cpu")
+        self.backend.setToolTip(BACKEND_TOOLTIP)
         self.backend.setCurrentIndex(max(0, BACKENDS.index(s.backend) if s.backend in BACKENDS else 0))
+        self.cpu_engine = QComboBox()
+        for key in CPU_ENGINES:
+            self.cpu_engine.addItem(ENGINE_LABELS[key], key)
+        self.cpu_engine.setCurrentIndex(max(0, self.cpu_engine.findData(s.cpu_engine)))
+        self.cpu_engine.setToolTip(
+            "Moteur employé quand le décodage tombe sur le CPU. faster-whisper "
+            "(CTranslate2) y décode environ trois fois plus vite que whisper.cpp "
+            "sur small. Ne repassez à whisper.cpp que si faster-whisper pose "
+            "problème sur cette machine — le résultat sera nettement plus lent."
+        )
+        self.cpu_compute = QComboBox()
+        self.cpu_compute.addItem("auto (déduite de la quantization du modèle)", "auto")
+        for key, label in (
+            ("int8", "int8 — le plus rapide"),
+            ("int8_float32", "int8_float32 — poids 8 bits, calcul 32 bits"),
+            ("float32", "float32 — référence, le plus lent"),
+        ):
+            self.cpu_compute.addItem(label, key)
+        self.cpu_compute.setCurrentIndex(max(0, self.cpu_compute.findData(s.cpu_compute_type)))
+        self.cpu_compute.setToolTip(
+            "Précision de calcul de faster-whisper. En « auto », elle suit la "
+            "quantization du modèle choisi : q5_* → int8, q8_0 → int8_float32, "
+            "f16 → float32. Sans effet sur le moteur GPU."
+        )
         self.halluc = QCheckBox("Filtre anti-hallucinations")
         self.halluc.setChecked(s.hallucination_filter)
         self.carry = QCheckBox("Report du contexte entre énoncés (déconseillé)")
@@ -187,6 +228,8 @@ class SettingsDialog(QDialog):
             "même sans session. Ne télécharge jamais un modèle absent."
         )
         aform.addRow("Backend moteur", self.backend)
+        aform.addRow("Moteur CPU", self.cpu_engine)
+        aform.addRow("Précision CPU", self.cpu_compute)
         aform.addRow("Intervalle min entre décodes (ms)", self.min_interval)
         aform.addRow("Fin d'énoncé : silence (ms)", self.silence)
         aform.addRow("Mots retenus (keep_back)", self.keep_back)
@@ -528,6 +571,8 @@ class SettingsDialog(QDialog):
             n_threads=self.threads.value() or None,
             flash_attn=self.flash.isChecked(),
             backend=self.backend.currentData(),
+            cpu_engine=self.cpu_engine.currentData(),
+            cpu_compute_type=self.cpu_compute.currentData(),
             hallucination_filter=self.halluc.isChecked(),
             carry_context=self.carry.isChecked(),
             engine_subprocess=self.subproc.isChecked(),

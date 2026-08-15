@@ -1,7 +1,11 @@
-"""Moteur whisper dans un PROCESSUS séparé, derrière la même API que WhisperEngine.
+"""Moteur dans un PROCESSUS séparé, derrière la même API que les moteurs locaux.
 
-Pourquoi : `WhisperEngine.transcribe()` passe des secondes entières dans du code
-natif. Dans le processus Qt, cela se paie deux fois —
+L'enfant charge celui des deux moteurs que `core/engines.py` retient
+(whisper.cpp au GPU, faster-whisper au CPU) : le parent, lui, ne voit qu'une
+seule surface — c'est tout l'intérêt.
+
+Pourquoi : `transcribe()` passe des secondes entières dans du code natif. Dans
+le processus Qt, cela se paie deux fois —
 
 1. **Gigue GIL** : le callback audio PortAudio et le rendu Qt sont des threads
    Python. Ils ne reprennent la main qu'aux relâchements du GIL par l'extension,
@@ -35,7 +39,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ecoutemoi.core.engine import EngineParams, Segment
+from ecoutemoi.core.engine_base import EngineParams, Segment
 
 log = logging.getLogger(__name__)
 
@@ -113,6 +117,8 @@ class SubprocessEngine:
         self.last_decode_ms = 0.0
         self.warmup_ms: list[float] = []
         self.restarts = 0
+        self.name = "?"  # moteur réellement chargé par l'enfant
+        self.fallback_reason: str | None = None
         self._backend_info = "CPU"
         self._gpu_devices: list[tuple[int, str]] = []
         self._gpu_active = False
@@ -155,6 +161,8 @@ class SubprocessEngine:
                     log.debug("moteur: %s", line)
 
     def _absorb_load(self, info: dict) -> None:
+        self.name = str(info.get("engine_name", "?"))
+        self.fallback_reason = info.get("fallback_reason")
         self.n_threads = int(info.get("n_threads", 0))
         self.vad_active = bool(info.get("vad_active", False))
         self.flash_attn_active = bool(info.get("flash_attn_active", False))
@@ -284,6 +292,7 @@ class SubprocessEngine:
     def diagnostics(self) -> dict:
         info = dict(self._diagnostics)
         info["processus"] = "sous-processus dédié"
+        info.setdefault("moteur", self.name)
         info["prechauffage_ms"] = [round(t) for t in self.warmup_ms]
         if self.restarts:
             info["redemarrages_moteur"] = self.restarts
@@ -312,7 +321,7 @@ class _SinkView:
 
 def _params_to_dict(params: EngineParams) -> dict:
     return {
-        "model_path": str(params.model_path),
+        "model_path": str(params.model_path) if params.model_path else None,
         "language": params.language,
         "translate": bool(params.translate),
         "n_threads": params.n_threads,
@@ -322,12 +331,17 @@ def _params_to_dict(params: EngineParams) -> dict:
         "carry_context": bool(params.carry_context),
         "gpu_device": int(params.gpu_device),
         "lexicon": params.lexicon,
+        "ct2_path": str(params.ct2_path) if params.ct2_path else None,
+        "compute_type": params.compute_type,
+        "beam_size": int(params.beam_size),
+        "engine": params.engine,
+        "vad_filter": bool(params.vad_filter),
     }
 
 
 def _params_from_dict(data: dict) -> EngineParams:
     return EngineParams(
-        model_path=Path(data["model_path"]),
+        model_path=Path(data["model_path"]) if data.get("model_path") else None,
         language=data.get("language", "fr"),
         translate=bool(data.get("translate", False)),
         n_threads=data.get("n_threads"),
@@ -337,6 +351,11 @@ def _params_from_dict(data: dict) -> EngineParams:
         carry_context=bool(data.get("carry_context", False)),
         gpu_device=int(data.get("gpu_device", 0)),
         lexicon=data.get("lexicon", "") or "",
+        ct2_path=Path(data["ct2_path"]) if data.get("ct2_path") else None,
+        compute_type=data.get("compute_type", "int8"),
+        beam_size=max(1, int(data.get("beam_size", 1))),
+        engine=data.get("engine", "auto"),
+        vad_filter=bool(data.get("vad_filter", True)),
     )
 
 
@@ -349,7 +368,7 @@ def worker_main() -> int:
     """
     import os
 
-    from ecoutemoi.core.engine import WhisperEngine
+    from ecoutemoi.core.engines import create_engine
 
     stdin_raw = sys.stdin.buffer if sys.stdin is not None else open(os.devnull, "rb")  # noqa: SIM115
     if sys.stdout is None:  # app fenêtrée : pas de stdout, rien à faire ici
@@ -357,7 +376,7 @@ def worker_main() -> int:
     protocol_out = os.fdopen(os.dup(sys.stdout.fileno()), "wb", buffering=0)
     sys.stdout = sys.stderr  # le tube de protocole ne doit recevoir aucun print applicatif
 
-    engine: WhisperEngine | None = None
+    engine = None
     try:
         while True:
             try:
@@ -367,7 +386,7 @@ def worker_main() -> int:
             cmd = request.get("cmd")
             try:
                 if cmd == "load":
-                    engine = WhisperEngine(_params_from_dict(request["params"]))
+                    engine = create_engine(_params_from_dict(request["params"]))
                     write_frame(protocol_out, {"ok": True, **_load_info(engine)})
                 elif cmd == "transcribe":
                     if engine is None:
@@ -410,6 +429,8 @@ def worker_main() -> int:
 
 def _load_info(engine) -> dict:
     return {
+        "engine_name": getattr(engine, "name", "?"),
+        "fallback_reason": getattr(engine, "fallback_reason", None),
         "n_threads": engine.n_threads,
         "vad_active": engine.vad_active,
         "flash_attn_active": engine.flash_attn_active,

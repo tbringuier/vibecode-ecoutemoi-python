@@ -19,9 +19,10 @@ détectée en continu, sous-titres toujours traduits en anglais).
 le codec, vers du texte : brut, Markdown, SRT, WebVTT, JSON, CSV, TSV, LRC — ou
 n'importe quelle autre extension.
 
-Le moteur est **whisper.cpp**, avec choix du backend : **Vulkan** ou **Metal** sur
-GPU, **CPU** sinon. Rien n'est envoyé nulle part, sauf si vous activez
-explicitement une sortie réseau.
+**Deux moteurs, chacun là où il gagne** (depuis la 2.0) : **faster-whisper**
+(CTranslate2) sur **CPU**, **whisper.cpp** sur **GPU** Vulkan ou Metal. Le
+backend se choisit d'un menu, ou se laisse en « Auto ». Rien n'est envoyé nulle
+part, sauf si vous activez explicitement une sortie réseau.
 
 ## Télécharger et lancer (binaires non signés — assumé)
 
@@ -61,7 +62,11 @@ qu'un direct reste bien plus rapide que le temps réel.
 |---|---|---|
 | libsndfile (livrée) | WAV, FLAC, **MP3**, OGG/Vorbis, Ogg Opus, AIFF, CAF, W64, AU | rien |
 | ffmpeg, s'il est présent | M4A/AAC, WMA, AMR, et les pistes audio de MP4, MKV, MOV, WebM, TS | `winget install --id Gyan.FFmpeg`, `brew install ffmpeg`, ou le paquet de votre distribution |
-| PyAV, s'il est importable | idem ffmpeg, en bibliothèque | présent en environnement de développement |
+| **PyAV (livrée depuis la 2.0)** | idem ffmpeg, en bibliothèque | rien — faster-whisper en dépend, elle est donc embarquée |
+
+Depuis la 2.0, installer ffmpeg n'est plus nécessaire : PyAV arrive avec
+faster-whisper et couvre les mêmes conteneurs. Un ffmpeg système reste préféré
+quand il est là, parce qu'il est souvent plus récent.
 
 Sous Windows, déposer `ffmpeg.exe` **à côté de `EcouteMoi.exe`** suffit : il est
 trouvé là aussi. Un chemin explicite peut être indiqué dans
@@ -89,20 +94,30 @@ et n'interrompt pas les autres ; le code de retour ne vaut 0 que si tout est pas
 
 ## Modèles et quantizations
 
-18 variantes multilingues du dépôt ggml officiel, de `tiny-q5_1` (31 Mo) à
-`large-v2-q8_0` (1,6 Go) — toutes celles qui peuvent tenir le temps réel sur une
-machine ou une autre, pour pouvoir les comparer au benchmark. **Aide →
-Quantizations — aide-mémoire** explique ce que valent `q5_0`, `q5_1`, `q8_0` et
-`f16`, et comment choisir selon CPU ou GPU.
+18 variantes multilingues, de `tiny-q5_1` (31 Mo en ggml) à `large-v2-q8_0`
+(1,6 Go) — toutes celles qui peuvent tenir le temps réel sur une machine ou une
+autre, pour pouvoir les comparer au benchmark. Les poids ggml viennent du dépôt
+officiel `ggerganov/whisper.cpp`, les conversions CTranslate2 des dépôts
+`Systran/faster-whisper-*` (et `mobiuslabsgmbh` pour `large-v3-turbo`), ceux-là
+mêmes qu'utilise faster-whisper — pas de conversion maison.
+
+**Aide → Quantizations — aide-mémoire** explique ce que valent `q5_0`, `q5_1`,
+`q8_0` et `f16`, comment choisir selon CPU ou GPU, et à quel type de calcul
+CTranslate2 chacun correspond (CTranslate2 ne descend pas sous 8 bits : `q5_0`
+et `q5_1` y arrivent tous deux sur `int8`).
 
 Deux familles sont volontairement absentes : les `large` en `f16` (2,9 Go, hors
 budget temps réel sur des fenêtres de 9 s) et les modèles `.en` (anglais
 uniquement et sans traduction — aucun des trois modes ne pourrait les employer).
 
 Un modèle peut aussi être installé **sans téléchargement** : déposez le `.bin`
-dans le dossier des modèles, ou **Gérer les modèles… → Importer un fichier…**
-(le nom du fichier identifie le modèle, le contenu est validé avant
-installation). En CLI : `--import-model FICHIER`.
+ggml dans le dossier des modèles, ou **Gérer les modèles… → Importer un .bin
+ggml…** (le nom du fichier identifie le modèle, le contenu est validé avant
+installation). En CLI : `--import-model FICHIER`. Un modèle CTranslate2 est un
+*dossier* : copiez-le dans `models/ct2/<famille>/`.
+
+En CLI, `--download` récupère par défaut le format dont le backend réglé a
+besoin ; `--format {ggml,ct2,both}` le force.
 
 ## Lexique de la conférence
 
@@ -151,29 +166,103 @@ seul détecteur de parole alimente les deux moteurs, donc la capture et le DSP n
 sont pas payés deux fois — mais **deux moteurs tournent** : la RAM se cumule et le
 voyant temps réel prend le pire des deux canaux.
 
-## Choix du backend (GPU / CPU)
+## Deux moteurs, un seul réglage
+
+Aucun moteur ne couvre bien tout le terrain, alors l'application en embarque deux
+et prend le meilleur de chacun :
+
+| | Moteur | Pourquoi lui |
+|---|---|---|
+| **GPU** Vulkan (Intel/AMD/NVIDIA) ou Metal (Apple) | **whisper.cpp** | c'est le seul des deux à savoir parler Vulkan et Metal. CTranslate2, sous faster-whisper, ne connaît que le CPU : sur un GPU, quel qu'en soit le vendeur, il n'existe pas. |
+| **CPU** | **faster-whisper** (CTranslate2) | environ **trois fois plus rapide** que whisper.cpp sur CPU, à qualité égale ou meilleure. |
+
+Mesuré sur un Intel Core Ultra 9 185H (6 P-cores) + Arc iGPU, fenêtre de 9 s,
+médiane de six décodages, modèle `small` :
+
+| Moteur / backend | Décodage | RTF | WER (voix de référence FR) |
+|---|---|---|---|
+| whisper.cpp / CPU | 3 529 ms | 2,6 | 8,5 % |
+| **faster-whisper / CPU** | **931 ms** | **9,7** | 8,5 % |
+| whisper.cpp / Vulkan | 754 ms | 11,9 | 8,5 % |
+
+Le cas le plus parlant est `medium`, où le changement n'est pas quantitatif mais
+qualitatif :
+
+| Moteur / backend (`medium-q5_0`) | Décodage | RTF | Verdict |
+|---|---|---|---|
+| whisper.cpp / CPU | 9 894 ms | **0,91** | 🔴 décroche — plus lent que le direct |
+| **faster-whisper / CPU** | **2 866 ms** | **3,14** | 🟢 fluide |
+| whisper.cpp / Vulkan | 2 093 ms | 4,30 | 🟢 fluide |
+
+Autrement dit : sur une machine sans GPU utilisable, `small` passe de « tout
+juste tenable » à « confortable », et `medium` d'**impossible** à fluide. Le GPU,
+lui, garde sa longueur d'avance — celle qu'on aurait perdue en remplaçant
+whisper.cpp partout, puisque CTranslate2 n'a pas de backend Vulkan ni Metal.
+
+### Le réglage
 
 Dans la fenêtre principale (« Backend ») ou dans **Réglages avancés** :
 
-- **Auto** — GPU (Vulkan/Metal) si disponible, repli CPU automatique ;
-- **GPU** — force Vulkan (Windows/Linux) ou Metal (macOS), avec avertissement
-  et repli CPU si aucun GPU n'est utilisable ;
-- **CPU** — n'utilise jamais le GPU.
+- **Auto** — GPU si un périphérique répond, sinon CPU ;
+- **GPU** — force whisper.cpp sur Vulkan (Windows/Linux) ou Metal (macOS), avec
+  avertissement et repli CPU si aucun GPU n'est utilisable ;
+- **CPU** — faster-whisper, sans jamais toucher au GPU.
 
-En CLI : `--backend {auto,gpu,cpu}`. Le backend réellement actif est affiché
-dans la barre d'état et dans les logs ; en cas de repli CPU, une notice explique
-pourquoi (moteur compilé sans GPU, ou pilote/périphérique absent).
+En CLI : `--backend {auto,gpu,cpu}`. Le moteur et le backend réellement actifs
+sont affichés dans la barre d'état, dans `--diag` et dans les logs ; en cas de
+repli, une notice dit **lequel** tourne et **pourquoi** l'autre a été écarté.
 
-Côté machine, Vulkan ne demande que les pilotes GPU : rien à installer sous
-Windows (le loader `vulkan-1.dll` accompagne le pilote) ; sous Linux, les pilotes
-Vulkan de la distribution (ex. `mesa-vulkan-drivers`) — vérifiables avec
-`vulkaninfo --summary`.
+**Réglages avancés** permet aussi de forcer whisper.cpp sur CPU (repli si
+faster-whisper pose problème sur une machine) et de choisir la précision de
+calcul CTranslate2 (`int8`, `int8_float32`, `float32`).
+
+### Deux moteurs, deux formats de modèle
+
+whisper.cpp lit du **ggml** (`ggml-small-q5_1.bin`), faster-whisper du
+**CTranslate2** (un dossier). Aucun des deux ne sait lire le format de l'autre.
+Conséquences visibles :
+
+- **Gérer les modèles…** a un sélecteur de format, et une colonne « Installé »
+  qui montre en permanence les deux ;
+- en « Auto », l'application **sonde le GPU au premier lancement** (quelques
+  dizaines de millisecondes, sans ouvrir de modèle, résultat mémorisé) pour ne
+  télécharger *que* le format dont elle a besoin. `--reprobe-gpu` refait le test
+  après un changement de pilote ;
+- un dossier CTranslate2 est **partagé par toutes les quantizations d'une même
+  famille** : la quantization y est un paramètre de chargement, pas un fichier.
+  Télécharger `small-q5_1` installe donc aussi `small-q8_0` et `small`.
+
+### Et ma carte NVIDIA / AMD / Intel ?
+
+**Vulkan les couvre toutes les trois**, sans rien installer : son loader est
+livré avec le pilote graphique. C'est pour ça qu'il est le chemin GPU principal
+et non un pis-aller — un seul backend, tous les vendeurs.
+
+CUDA, ROCm, OpenVINO et oneAPI ne sont pas proposés : chacun exige une
+installation de plusieurs gigaoctets sur la machine de l'utilisateur, ou
+n'accélère que l'encodeur à partir d'un modèle converti hors ligne. Pour un
+matériel que Vulkan sert déjà immédiatement.
+
+### Ce qui a été mesuré et écarté
+
+- **Décodage par lots** (`BatchedInferencePipeline` de faster-whisper), sur 258 s
+  d'audio : `small` **aucun gain** (10,0 s → 10,1 s), `medium` +18 % de vitesse
+  mais **WER de 8,5 % à 10,5 %**. Le lot sert à remplir un GPU ; sur CPU,
+  CTranslate2 sature déjà les cœurs avec une seule séquence. Non retenu.
+- **Faisceau de décodage sur fichier** (beam 5), même mesure : +35 % de temps
+  pour un **WER de 8,5 % à 5,9 %**. Retenu — hors direct, personne n'attend.
+
+### Côté machine
+
+Vulkan ne demande que les pilotes GPU : rien à installer sous Windows (le loader
+`vulkan-1.dll` accompagne le pilote) ; sous Linux, les pilotes Vulkan de la
+distribution (ex. `mesa-vulkan-drivers`) — vérifiables avec `vulkaninfo --summary`.
 
 Sur CPU, le moteur utilise par défaut autant de threads que de **P-cores
 physiques** (CPU hybrides Intel/Apple), sinon tous les cœurs physiques — jamais
 l'hyperthreading. Au premier lancement, le modèle par défaut est **profilé sur
 la machine** (cœurs utiles + RAM : tiny / base / small) ; le benchmark guidé
-affine ensuite.
+affine ensuite, en mesurant le moteur qui tournera vraiment.
 
 ## Sorties : OBS et page web
 
@@ -250,10 +339,12 @@ uv run pytest -m "not integration"
 uv run ecoutemoi            # interface graphique
 ```
 
-> La wheel pywhispercpp de PyPI est compilée **sans** backend GPU : en dev,
-> l'application tourne donc en CPU. Pour le GPU en dev, compilez la wheel locale :
-> `bash scripts/build_wheel.sh` (Linux, paquets `cmake glslc libvulkan-dev`)
-> ou `scripts/build_wheel.ps1` (Windows, SDK Vulkan LunarG), puis
+> **faster-whisper** (le moteur CPU) s'installe tel quel depuis PyPI : rien à
+> compiler. La wheel **pywhispercpp** de PyPI, en revanche, est compilée **sans**
+> backend GPU — en dev, le backend « gpu » retombe donc sur le CPU. Pour le GPU
+> en dev, compilez la wheel locale : `bash scripts/build_wheel.sh` (Linux,
+> paquets `cmake glslc libvulkan-dev`) ou `scripts/build_wheel.ps1` (Windows,
+> SDK Vulkan LunarG), puis
 > `uv pip install wheelhouse/pywhispercpp-*.whl --force-reinstall`.
 > Ensuite **toujours** `uv run --no-sync` : un `uv sync` restaurerait la wheel CPU.
 
@@ -261,14 +352,19 @@ uv run ecoutemoi            # interface graphique
 
 ```bash
 uv run ecoutemoi --list-devices
-uv run ecoutemoi --download small-q5_1
+uv run ecoutemoi --list-models                                   # registre, les 2 formats
+uv run ecoutemoi --download small-q5_1                           # format du backend réglé
+uv run ecoutemoi --download small-q5_1 --format both             # ggml ET CTranslate2
 uv run ecoutemoi --cli --model small-q5_1 --mode fr --preset stable
 uv run ecoutemoi --transcribe discours.mp3 --to srt,txt          # hors direct
 uv run ecoutemoi --cli --wav discours.wav --rate realtime        # simulation direct
-uv run ecoutemoi --cli --backend cpu                             # forcer le CPU
+uv run ecoutemoi --cli --backend cpu                             # faster-whisper
+uv run ecoutemoi --cli --backend gpu                             # whisper.cpp Vulkan/Metal
 uv run ecoutemoi --rtf tiny-q5_1,base-q5_1 --wav calibration_fr.wav
 uv run ecoutemoi --bench --wav-fr fr.wav --wav-en en.wav         # bench complet + JSON
-uv run ecoutemoi --diag                                          # environnement, GPU, modèles
+uv run ecoutemoi --diag                                          # moteurs, GPU, modèles
+uv run ecoutemoi --check-engines                                 # les 2 moteurs sont-ils là ?
+uv run ecoutemoi --reprobe-gpu                                   # re-tester le GPU
 ```
 
 Seul le texte **validé** est imprimé en mode console. Réglages persistés (JSON
@@ -312,14 +408,24 @@ et l'application resterait en CPU).
 libsndfile y est embarquée explicitement — `soundfile` est un module et non un
 paquet, les collecteurs automatiques de PyInstaller ne la voient pas.
 
+Le second moteur alourdit le binaire : `libctranslate2`, `tokenizers`,
+`onnxruntime` (le VAD Silero interne de faster-whisper) et PyAV s'ajoutent aux
+libs ggml. Deux garde-fous font échouer le build plutôt que de livrer un bundle
+amputé — l'un exige `ggml-vulkan` (sinon l'artefact n'aurait jamais de GPU),
+l'autre `libctranslate2` et le `.onnx` Silero (sinon le moteur CPU serait absent
+ou muet). Le premier est contournable par `ECOUTEMOI_ALLOW_CPU_BUNDLE=1`, en
+connaissance de cause.
+
 ## Licence
 
 **GPL-3.0-or-later** — voir [LICENSE](LICENSE). Copyleft assumé : toute
 redistribution, modifiée ou non, doit rester libre et sous la même licence. C'est
 la traduction juridique de « ce logiciel est et doit rester gratuit ».
 
-Les modèles Whisper (ggml) sont © OpenAI / ggml-org et suivent leurs propres
-licences. L'interface utilise Qt via PySide6 (LGPL, bibliothèques dynamiques) ;
-libsndfile est sous LGPL-2.1-or-later.
+Les modèles Whisper sont © OpenAI et suivent leurs propres licences ; les
+conversions sont publiées par ggml-org (ggml) et Systran / mobiuslabs
+(CTranslate2). L'interface utilise Qt via PySide6 (LGPL, bibliothèques
+dynamiques) ; libsndfile est sous LGPL-2.1-or-later ; faster-whisper et
+CTranslate2 sont sous MIT ; PyAV sous BSD-3-Clause (et embarque ffmpeg, LGPL).
 
 Journal des versions : [CHANGELOG.md](CHANGELOG.md).

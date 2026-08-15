@@ -1,4 +1,9 @@
-"""WhisperEngine: pywhispercpp wrapper.
+"""WhisperEngine : moteur whisper.cpp (pywhispercpp) — Vulkan, Metal, CPU.
+
+C'est LE moteur GPU d'Écoute Moi : le seul des deux à savoir parler Vulkan
+(Intel/AMD) et Metal (Apple Silicon). Sur CPU, `core/engine_fw.py`
+(faster-whisper) est nettement plus rapide et prend le relais — whisper.cpp
+reste le filet de sécurité quand faster-whisper n'est pas installable.
 
 Design notes:
 - pywhispercpp is imported lazily so the package imports without the wheel.
@@ -16,26 +21,28 @@ import inspect
 import logging
 import re
 import sys
-import threading
 import time
-from collections import deque
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 from ecoutemoi.constants import (
-    TARGET_SR,
     VAD_MIN_SILENCE_MS,
     VAD_MIN_SPEECH_MS,
     VAD_SAMPLES_OVERLAP,
     VAD_SPEECH_PAD_MS,
     VAD_THRESHOLD,
-    WARMUP_AUDIO_S,
-    WARMUP_MAX_PASSES,
-    WARMUP_STABLE_RATIO,
 )
-from ecoutemoi.core import cpuinfo
+from ecoutemoi.core.engine_base import (
+    LEXICON_MAX_CHARS,
+    EngineParams,
+    Segment,
+    WarmupMixin,
+    _LogSink,
+    normalize_lexicon,
+    pick_n_threads,
+    warmup_audio,
+)
 
 log = logging.getLogger(__name__)
 
@@ -124,74 +131,6 @@ def centi_to_ms(t: int | float) -> int:
     return round(t * 10)
 
 
-# Le prompt initial de whisper est PLAFONNÉ à la moitié de la fenêtre de texte du
-# décodeur (224 tokens sur 448) ; au-delà, whisper tronque — par la gauche, donc
-# silencieusement et par le début de la liste. On borne donc nous-mêmes, en
-# caractères, avec une marge : ~4 caractères par token en français.
-LEXICON_MAX_CHARS = 700
-
-
-def normalize_lexicon(text: str) -> str:
-    """Lexique opérateur -> prompt initial whisper exploitable.
-
-    Le prompt est du TEXTE, pas une liste : whisper le lit comme le début d'une
-    transcription. Une énumération séparée par des virgules suffit à biaiser le
-    décodeur vers ces graphies. On aplatit les retours à la ligne (l'opérateur
-    saisit volontiers un mot par ligne) et on tronque proprement sur une
-    frontière de mot plutôt que de laisser whisper couper au milieu.
-    """
-    parts = (part.strip(" \t,;") for part in text.replace("\n", ",").split(","))
-    flat = ", ".join(part for part in parts if part)
-    if len(flat) <= LEXICON_MAX_CHARS:
-        return flat
-    cut = flat[:LEXICON_MAX_CHARS]
-    head, sep, _ = cut.rpartition(", ")
-    truncated = head if sep else cut
-    log.warning(
-        "Lexique tronqué à %d caractères (%d fournis) : whisper plafonne le prompt initial.",
-        len(truncated), len(flat),
-    )  # fmt: skip
-    return truncated
-
-
-def warmup_audio() -> np.ndarray:
-    """~1 s de PAROLE réelle, pour le préchauffage du moteur.
-
-    Du silence ne conviendrait pas : avec le VAD interne de whisper.cpp actif,
-    une fenêtre muette est écartée AVANT l'encodeur — aucun shader compilé,
-    aucun graphe alloué, et le coût du premier vrai décodage reste entier. On
-    réutilise donc la voix de référence déjà embarquée pour le benchmark ; à
-    défaut, un signal voisé synthétique (harmoniques à 120 Hz, 4 syllabes/s).
-    """
-    n = int(TARGET_SR * WARMUP_AUDIO_S)
-    try:
-        import wave
-
-        import ecoutemoi
-
-        path = Path(ecoutemoi.__file__).resolve().parent / "assets" / "calibration" / "calibration_fr.wav"
-        with wave.open(str(path), "rb") as w:
-            if (w.getframerate(), w.getsampwidth(), w.getnchannels()) == (TARGET_SR, 2, 1):
-                w.setpos(min(TARGET_SR, max(0, w.getnframes() - n)))  # saute le silence de tête
-                x = np.frombuffer(w.readframes(n), dtype=np.int16).astype(np.float32) / 32768.0
-                if x.size >= TARGET_SR // 2:
-                    return np.ascontiguousarray(x)
-    except Exception as exc:
-        log.debug("Voix de préchauffage indisponible (%s) — repli synthétique", exc)
-    t = np.arange(n, dtype=np.float32) / TARGET_SR
-    voiced = sum(np.sin(2.0 * np.pi * 120.0 * k * t) / k for k in (1, 2, 3, 4, 5))
-    envelope = 0.5 * (1.0 - np.cos(2.0 * np.pi * 4.0 * t))
-    return (0.2 * voiced * envelope).astype(np.float32)
-
-
-def pick_n_threads(requested: int | None = None) -> int:
-    """P-cores physiques (CPU hybride) sinon cœurs physiques ; jamais le SMT.
-    Une valeur demandée explicitement est honorée telle quelle."""
-    if requested is not None and requested > 0:
-        return requested
-    return cpuinfo.best_n_threads()
-
-
 def gpu_backend_libs() -> list[str]:
     """Noms des libs backend GPU (ggml-vulkan/metal) livrées à côté du moteur.
 
@@ -230,34 +169,16 @@ def gpu_fallback_reason(sink_lines: list[str], backend_shipped: bool) -> str:
     )
 
 
-@dataclass
-class Segment:
-    t0_ms: int
-    t1_ms: int
-    text: str
-    no_speech_prob: float | None = None
-
-
-@dataclass
-class EngineParams:
-    model_path: Path
-    language: str = "fr"  # "auto" => détection sur le premier énoncé
-    translate: bool = False
-    n_threads: int | None = None
-    backend: str = "auto"  # auto | gpu | cpu
-    flash_attn: bool = True
-    vad_model_path: Path | None = None
-    carry_context: bool = False
-    gpu_device: int = 0  # index du périphérique GPU (multi-GPU)
-    lexicon: str = ""  # noms propres / acronymes du talk (whisper initial_prompt)
-
-
 def backend_attempts(backend: str, flash_attn: bool, gpu_device: int = 0) -> list[tuple[str, dict]]:
     """Ordered context-param ladder for a requested backend.
 
     - "cpu": CPU only, never touches the GPU.
     - "gpu" / "auto": GPU first (with then without flash attention), CPU as the
       final safety net so a broken driver never prevents a session from starting.
+    - "gpu-only": les deux barreaux GPU, SANS filet CPU. C'est ce que demande
+      `core/engines.py` en mode auto : si le GPU ne répond pas, le repli n'est
+      plus le CPU de whisper.cpp mais faster-whisper, bien plus rapide — il faut
+      donc que l'échec soit visible ici plutôt que masqué par un repli interne.
     Le rung CPU ne porte jamais gpu_device : il doit rester insensible au GPU.
     """
     if backend == "cpu":
@@ -265,8 +186,9 @@ def backend_attempts(backend: str, flash_attn: bool, gpu_device: int = 0) -> lis
     attempts = [
         ("full", {"use_gpu": True, "flash_attn": flash_attn, "gpu_device": gpu_device}),
         ("no-flash", {"use_gpu": True, "flash_attn": False, "gpu_device": gpu_device}),
-        ("cpu", {"use_gpu": False, "flash_attn": False}),
     ]
+    if backend != "gpu-only":
+        attempts.append(("cpu", {"use_gpu": False, "flash_attn": False}))
     seen: set[tuple] = set()
     out: list[tuple[str, dict]] = []
     for name, ctx in attempts:
@@ -293,30 +215,10 @@ def supported_context_keys() -> set[str] | None:
         return None
 
 
-class _LogSink:
-    """File-like object capturing whisper.cpp log lines (backend + language info)."""
-
-    def __init__(self, keep: int = 800):
-        self.lines: deque[str] = deque(maxlen=keep)
-        self._buf = ""
-        self._lock = threading.Lock()
-
-    def write(self, s: str) -> None:
-        with self._lock:
-            self._buf += s
-            while "\n" in self._buf:
-                line, self._buf = self._buf.split("\n", 1)
-                line = line.strip()
-                if line:
-                    self.lines.append(line)
-                    log.debug("whisper.cpp: %s", line)
-
-    def flush(self) -> None:
-        pass
-
-
-class WhisperEngine:
+class WhisperEngine(WarmupMixin):
     """One Model instance per (model, backend); a single thread calls transcribe()."""
+
+    name = "whispercpp"
 
     def __init__(self, params: EngineParams):
         self.params = params
@@ -329,6 +231,7 @@ class WhisperEngine:
         self.load_s = 0.0
         self.last_decode_ms = 0.0
         self.warmup_ms: list[float] = []
+        self.fallback_reason: str | None = None  # posé par core/engines si repli
         self._gpu_requested = False
         self._model = None
         self._load()
@@ -538,44 +441,6 @@ class WhisperEngine:
             out.append(Segment(centi_to_ms(s.t0), centi_to_ms(s.t1), text, nsp))
         return out
 
-    # ---------------------------------------------------------------- préchauffage
-    def warmup(self, on_pass=None, should_stop=None) -> list[float]:
-        """Décodages à blanc jusqu'à stabilisation ; retourne les temps (ms).
-
-        Le premier décodage d'un moteur frais paie la compilation des shaders
-        Vulkan, l'allocation du graphe et le remplissage des caches : de quelques
-        secondes à une minute au tout premier lancement sur une machine donnée.
-        Payé PENDANT la session, ce coût produit un tampon d'audio en retard puis
-        une rafale de rattrapage avant de revenir au temps réel. Payé ici, avant
-        l'ouverture du micro, il ne coûte que de l'attente au démarrage.
-
-        `on_pass(i, total)` suit la progression, `should_stop()` interrompt.
-        """
-        audio = warmup_audio()
-        times: list[float] = []
-        for i in range(1, WARMUP_MAX_PASSES + 1):
-            if should_stop is not None and should_stop():
-                break
-            if on_pass is not None:
-                on_pass(i, WARMUP_MAX_PASSES)
-            try:
-                self.transcribe(audio)
-            except Exception as exc:  # un échec ici se reproduira en session
-                log.warning("Passe de préchauffage %d en échec : %s", i, exc)
-                break
-            times.append(self.last_decode_ms)
-            # Stable dès qu'une passe retombe au niveau de la meilleure observée :
-            # le surcoût unique (shaders, caches) est absorbé.
-            if len(times) >= 2 and times[-1] <= min(times) * WARMUP_STABLE_RATIO:
-                break
-        self.warmup_ms = times
-        if times:
-            log.info(
-                "Préchauffage : %d passe(s) — %s ms",
-                len(times), ", ".join(f"{t:.0f}" for t in times),
-            )  # fmt: skip
-        return times
-
     # ---------------------------------------------------------------- helpers
     def detected_language(self) -> str | None:
         for line in reversed(self.sink.lines):
@@ -668,6 +533,7 @@ class WhisperEngine:
     def diagnostics(self) -> dict:
         """État structuré du moteur pour --diag et le dialogue GUI « Diagnostic »."""
         info: dict = {
+            "moteur": "whisper.cpp (pywhispercpp)",
             "modele": Path(self.params.model_path).name,
             "backend": self.backend_info(),
             "gpu_actif": self.gpu_active(),
@@ -723,3 +589,22 @@ def _register_log_callback_atexit() -> None:
 
         atexit.register(_reset_whisper_log_callback)
         _atexit_registered = True
+
+
+# Ré-exports : `EngineParams`, `Segment` et le lexique ont migré dans
+# `engine_base` (socle partagé avec faster-whisper) mais restent importables
+# ici — c'est l'adresse qu'utilisent la GUI, le sous-processus et les tests.
+__all__ = [
+    "LEXICON_MAX_CHARS",
+    "EngineParams",
+    "Segment",
+    "WhisperEngine",
+    "backend_attempts",
+    "centi_to_ms",
+    "gpu_backend_libs",
+    "gpu_fallback_reason",
+    "normalize_lexicon",
+    "pick_n_threads",
+    "supported_context_keys",
+    "warmup_audio",
+]
