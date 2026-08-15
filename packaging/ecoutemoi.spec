@@ -29,24 +29,25 @@ _site = Path(sysconfig.get_paths()["purelib"])
 binaries = []
 binaries += collect_dynamic_libs("pyrnnoise")  # rnnoise.dll / librnnoise.so / .dylib
 binaries += collect_dynamic_libs("pywhispercpp")  # ggml/whisper libs if the wheel ships any
-# onnxruntime range ses libs DANS le paquet (capi/) : collect_dynamic_libs suffit.
-binaries += collect_dynamic_libs("onnxruntime")
-
-# Wheels réparées par auditwheel (Linux) ou delvewheel (Windows) : les libs
-# natives vivent dans un dossier FRÈRE `<paquet>.libs/`, hors de tout package —
-# collect_dynamic_libs ne les voit donc pas. C'est le cas de libctranslate2
-# (75 Mo, le moteur CPU) et de tout ffmpeg sous PyAV. L'analyse binaire les
-# suivrait par la chaîne NEEDED, mais on les embarque explicitement : c'est ce
-# qui rend les garde-fous plus bas capables de distinguer un bundle complet d'un
-# bundle amputé, AVANT d'empaqueter plutôt qu'au premier lancement.
-# (macOS/delocate range les siennes dans `<paquet>/.dylibs/`, dans le paquet.)
-for _sibling in ("ctranslate2.libs", "av.libs", "tokenizers.libs"):
-    _libdir = _site / _sibling
-    if _libdir.is_dir():
+# Les libs natives du moteur CPU (libctranslate2, 75 Mo) et de PyAV atterrissent
+# à un endroit DIFFÉRENT selon l'outil de réparation de wheel de chaque
+# plateforme. Il faut les trois, sinon le bundle est complet ici et amputé
+# ailleurs — ce qui s'est produit : le garde-fou plus bas a fait échouer le
+# build Windows alors que Linux passait.
+#   auditwheel (Linux)  -> dossier FRÈRE `<paquet>.libs/`, hors de tout package
+#   delocate  (macOS)   -> `<paquet>/.dylibs/`, dans le package
+#   delvewheel (Windows)-> .dll DANS le package (ctranslate2 ajoute d'ailleurs
+#                          son propre dossier au DLL search path à l'import)
+# L'analyse binaire de PyInstaller les suivrait par la chaîne NEEDED, mais on
+# les embarque explicitement : c'est ce qui permet aux garde-fous de distinguer
+# un bundle complet d'un bundle amputé AVANT d'empaqueter.
+for _pkg in ("ctranslate2", "av", "tokenizers", "onnxruntime"):
+    binaries += collect_dynamic_libs(_pkg)  # dans le package (Windows, onnxruntime/capi)
+    _libdir = _site / f"{_pkg}.libs"
+    if _libdir.is_dir():  # auditwheel
         binaries += [(str(f), ".") for f in _libdir.iterdir() if f.is_file()]
-for _pkg in ("ctranslate2", "av", "tokenizers"):
     _dylibs = _site / _pkg / ".dylibs"
-    if _dylibs.is_dir():
+    if _dylibs.is_dir():  # delocate
         binaries += [(str(f), ".") for f in _dylibs.iterdir() if f.is_file()]
 
 # La wheel moteur compilée localement (non réparée par auditwheel/delocate/
@@ -116,7 +117,8 @@ _bin_names = " ".join(Path(_src).name.lower() for _src, _dest in binaries)
 if "ctranslate2" not in _bin_names:
     raise SystemExit(
         "ecoutemoi.spec : aucune lib ctranslate2 collectée — le moteur CPU "
-        "(faster-whisper) serait absent du bundle. Vérifiez `uv sync`."
+        f"(faster-whisper) serait absent du bundle. Cherchée dans {_site}/ctranslate2/, "
+        f"{_site}/ctranslate2.libs/ et {_site}/ctranslate2/.dylibs/. Vérifiez `uv sync`."
     )
 if not any("silero" in Path(_src).name.lower() for _src, _dest in datas):
     raise SystemExit(
