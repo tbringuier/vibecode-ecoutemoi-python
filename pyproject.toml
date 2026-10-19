@@ -7,7 +7,7 @@ name = "ecoutemoi"
 dynamic = ["version"]
 description = "Écoute Moi — sous-titrage temps réel local et transcription de fichiers (faster-whisper au CPU, whisper.cpp au GPU Vulkan / Metal)"
 readme = "README.md"
-requires-python = ">=3.14,<3.15"
+requires-python = ">=3.15,<3.16"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 authors = [{ name = "Tristan Bringuier" }]
