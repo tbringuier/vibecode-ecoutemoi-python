@@ -45,15 +45,21 @@ on:
         options: [info, debug]
         default: info
 
-# Jamais deux Renovate en parallèle sur le même dépôt : ils se marcheraient sur
-# les branches. Pas d'annulation en cours de route — une exécution interrompue
-# peut laisser une branche à moitié poussée.
-concurrency:
-  group: renovate
-  cancel-in-progress: false
-
 permissions:
   contents: read
+
+env:
+  # UNE version de Renovate pour le validateur ET pour le bot : les deux jobs
+  # tirent la même image. Sans ça, `npx renovate` validait avec la version que
+  # npm voulait bien choisir selon Node (antérieure au bot avec Node 22,
+  # postérieure avec Node 26), et une config jugée valide pouvait être
+  # rejetée ou migrée par le bot.
+  # Renovate propose lui-même la major suivante (customManagers:
+  # githubActionsVersions dans renovate.json5). Sur cette PR, le job
+  # `validate` tourne déjà avec la nouvelle image et signale les migrations
+  # de config à faire avant que le bot ne les subisse.
+  # renovate: datasource=docker depName=ghcr.io/renovatebot/renovate
+  RENOVATE_VERSION: "44"
 
 jobs:
   # Une config invalide ne fait pas échouer Renovate : elle le fait abandonner
@@ -67,19 +73,14 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      # Node récent requis : sans lui, npm retombe sur une version antérieure de
-      # Renovate et la config serait validée avec les règles de la mauvaise
-      # version.
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "22"
+      # L'image exacte que `renovatebot/github-action` lance dans le job
+      # suivant : même version, mêmes règles, et pas de Node à installer.
       - name: renovate-config-validator (strict)
-        env:
-          # Les dépendances transitives de Renovate traînent une dizaine de
-          # `npm warn deprecated` : rien d'actionnable ici, et ça noie le seul
-          # message qui compte (« Config validated successfully »).
-          npm_config_loglevel: error
-        run: npx --yes --package renovate renovate-config-validator --strict
+        run: |
+          docker run --rm \
+            --volume "$PWD:/usr/src/app:ro" --workdir /usr/src/app \
+            "ghcr.io/renovatebot/renovate:${RENOVATE_VERSION}" \
+            renovate-config-validator --strict
 
   renovate:
     name: renovate
@@ -87,6 +88,17 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # Jamais deux Renovate en parallèle sur le même dépôt : ils se marcheraient
+    # sur les branches. Pas d'annulation en cours de route — une exécution
+    # interrompue peut laisser une branche à moitié poussée.
+    #
+    # Au niveau du JOB, pas du workflow : au niveau workflow, la validation
+    # d'une PR attendait derrière le bot, et GitHub ne garde qu'UN run en
+    # attente par groupe. Deux PR touchant renovate.yml s'annulaient donc
+    # l'une l'autre leur validation.
+    concurrency:
+      group: renovate
+      cancel-in-progress: false
     permissions:
       contents: write # pousser les branches de mise à jour
       pull-requests: write # ouvrir et mettre à jour les PR
@@ -135,6 +147,7 @@ jobs:
       - uses: renovatebot/github-action@v46.3.14
         with:
           token: ${{ secrets.RENOVATE_TOKEN || github.token }}
+          renovate-version: ${{ env.RENOVATE_VERSION }}
         env:
           # Un seul dépôt, pas d'auto-découverte : le bot ne peut pas déborder
           # sur d'autres dépôts du compte si le jeton est plus large que prévu.
