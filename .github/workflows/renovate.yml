@@ -12,7 +12,9 @@
 # ┌─ INDISPENSABLE ────────────────────────────────────────────────────────────┐
 # │ Le secret RENOVATE_TOKEN doit exister (jeton personnel « fine-grained »    │
 # │ sur ce dépôt, permissions Contents: read/write, Pull requests: read/write, │
-# │ Issues: read/write pour le tableau de bord).                               │
+# │ Issues: read/write pour le tableau de bord, Workflows: read/write pour     │
+# │ les PR qui touchent .github/workflows). Pas de « Commit statuses » :       │
+# │ renovate.json5 désactive les statuts (voir `statusCheckNames`).            │
 # │                                                                            │
 # │ Sans lui, on retombe sur GITHUB_TOKEN — et GitHub refuse par conception de │
 # │ déclencher un workflow depuis une PR ouverte par GITHUB_TOKEN. Les PR de   │
@@ -184,6 +186,11 @@ jobs:
             echo "refusée en cours de route. Vérifier les permissions du jeton"
             echo "\`RENOVATE_TOKEN\` (\`Contents\`, \`Pull requests\`, \`Issues\`,"
             echo "\`Workflows\` en lecture/écriture) et sa date d'expiration."
+            echo
+            echo "Dans le log, « Repository has changed during renovation - aborting »"
+            echo "peut cacher un 403 de l'API GitHub. Relancer à la main avec"
+            echo "\`logLevel: debug\` et chercher \`x-accepted-github-permissions\` :"
+            echo "c'est la permission manquante."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::error title=Branches renovate sans PR::${orphans[*]}"
           exit 1

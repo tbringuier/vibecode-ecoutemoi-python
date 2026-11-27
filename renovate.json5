@@ -53,6 +53,28 @@
   },
   osvVulnerabilityAlerts: true,
 
+  // Aucun statut de commit posé par Renovate. Le jeton n'a donc pas besoin de
+  // la permission « Commit statuses ». Si on la lui demandait, il suffirait
+  // de l'oublier pour casser TOUS les runs, en silence :
+  // POST /statuses → 403 → Renovate le rapporte comme « Repository has
+  // changed during renovation - aborting » et s'arrête sur la première branche
+  // soumise à minimumReleaseAge, avant d'ouvrir sa PR. C'est ce qui a bloqué
+  // toutes les PR non sécurité d'août à novembre 2026.
+  //
+  // Ce que ça coûte : rien pour stability-days (avec minimumReleaseAge, la
+  // branche n'existe qu'une fois le délai écoulé, donc le statut est toujours
+  // vert) ni pour merge-confidence (API Mend, non utilisée) ou
+  // config-validation (le job `validate` du workflow fait ce travail). Le
+  // statut `renovate/artifacts` (échec de mise à jour du lock) est remplacé
+  // par `uv lock --check` dans le lint, qui couvre aussi les PR humaines.
+  // Renovate commente toujours la PR en cas d'échec d'artefact.
+  statusCheckNames: {
+    artifactError: null,
+    configValidation: null,
+    mergeConfidence: null,
+    minimumReleaseAge: null,
+  },
+
   packageRules: [
     {
       description: "Le conteneur ubuntu:22.04 du job Linux EST le plancher de compatibilité glibc 2.35 de l'AppImage. Le monter n'est pas une mise à jour, c'est une décision de support : elle se prend à la main.",

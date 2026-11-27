@@ -65,6 +65,12 @@ jobs:
         run: uv sync --frozen --only-group dev --no-install-project
       - run: uv run --no-sync ruff check .
       - run: uv run --no-sync ruff format --check .
+      # Tous les autres jobs font `uv sync --frozen`, qui installe le lock tel
+      # quel sans vérifier qu'il correspond encore à pyproject.toml. Sans ce
+      # contrôle, une contrainte modifiée sans relocker (à la main, ou par une
+      # PR Renovate dont la mise à jour du lock a échoué) passerait au vert.
+      - name: uv.lock à jour avec pyproject.toml
+        run: uv lock --check
 
   test:
     name: tests unitaires (ubuntu)
