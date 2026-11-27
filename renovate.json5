@@ -10,6 +10,9 @@
     ":dependencyDashboard",
     ":semanticCommitsDisabled", // l'historique du dépôt est en français, sans préfixe conventionnel
     ":rebaseStalePrs",
+    // Suit les variables `*_VERSION` annotées `# renovate:` dans les
+    // workflows — ici RENOVATE_VERSION, la version du bot ET du validateur.
+    "customManagers:githubActionsVersions",
   ],
   timezone: "Europe/Paris",
 
@@ -20,7 +23,7 @@
   schedule: ["at any time"],
 
   labels: ["dépendances"],
-  dependencyDashboardTitle: "Tableau de bord des dépendances",
+  dependencyDashboard: { title: "Tableau de bord des dépendances" },
 
   commitMessageAction: "Mettre à jour",
   commitMessageTopic: "{{depName}}",
@@ -81,6 +84,11 @@
       matchDatasources: ["docker"],
       matchPackageNames: ["ubuntu"],
       enabled: false,
+    },
+    {
+      description: "Changer de version de Python (requires-python, .python-version) suppose que TOUTES les dépendances natives publient des wheels pour elle. En novembre 2026, onnxruntime (tiré par faster-whisper) n'a ni wheel cp315 ni sdist : la PR 3.15 ne pouvait qu'échouer. La montée attend donc une case cochée dans le tableau de bord, une fois les wheels disponibles.",
+      matchDepNames: ["python"],
+      dependencyDashboardApproval: true,
     },
     {
       description: "Une seule PR pour toutes les actions GitHub — elles bougent souvent et cassent rarement seules.",
